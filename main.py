@@ -675,32 +675,44 @@ class GeminiArtist(Star):
                 self.store_user_image(user_id, group_id, msg_component.url, getattr(msg_component, 'file', None))
 
     @filter.llm_tool(name="gemini_draw")
-    async def gemini_draw(self, event: AstrMessageEvent, prompt: str, image_index: int = 0, reference_bot: bool = False, aspect_ratio: str = "1:1") -> AsyncGenerator[Any, None]:
+    async def gemini_draw(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        image_index: int = 0,
+        reference_bot: bool = False,
+        aspect_ratio: str = "1:1"
+    ) -> AsyncGenerator[Any, None]:
         '''
         AI图像生成与编辑工具。支持文生图、图生图、图像编辑等多种功能。
         Args:
             prompt (string): 图像生成或编辑的详细描述。
             image_index (number, optional): 引用历史图片数量。0=不引用，1=引用最新1张，2=引用最新2张。默认0。
             reference_bot (boolean, optional): 是否引用机器人之前生成的图片。默认False。
-            aspect_ratio (string, optional): 图片宽高比。可选: "1:1"(方形), "16:9"(横屏), "9:16"(竖屏), "4:3"(横向), "3:4"(竖向)。根据内容自动选择，风景用16:9，人像用3:4。默认"1:1"。
+            aspect_ratio (string, optional): 图片宽高比。可选: "1:1"(方形), "16:9"(横屏), "9:16"(竖屏), "4:3"(横向), "3:4"(竖向)。默认"1:1"。
         '''
         if not self.api_keys:
             yield event.plain_result("请联系管理员配置API密钥。")
             return
-        if not hasattr(event, 'message_obj') or not hasattr(event.message_obj, 'type'):
-            logger.error(f"gemini_draw: 事件对象缺少 message_obj 或 type 属性。")
+
+        if not hasattr(event, "message_obj") or not hasattr(event.message_obj, "type"):
+            logger.error("gemini_draw: 事件对象缺少 message_obj 或 type 属性。")
             yield event.plain_result("处理消息时出错。")
             return
 
         command_sender_id = event.get_sender_id()
         group_id = event.message_obj.group_id
 
+        # 白名单
         if self.group_whitelist and str(event.message_obj.group_id or command_sender_id) not in map(str, self.group_whitelist):
             return
+
+        # 忽略机器人自身
         if self.robot_id_from_config and command_sender_id == self.robot_id_from_config:
             return
+
         # ===== 预算检查 =====
-        budget_group_id = str(group_id) if group_id else command_sender_id
+        budget_group_id = str(group_id) if group_id else str(command_sender_id)
         budget_allowed, budget_spent, budget_remaining = self._check_budget(budget_group_id)
         if not budget_allowed:
             budget_msg = f"今日该群画图额度已用完（已消耗 ¥{budget_spent:.2f}/¥{self.daily_group_budget:.2f}），明天零点重置哦~"
@@ -711,47 +723,48 @@ class GeminiArtist(Star):
                 "user_instruction_for_llm": f"绘图预算已耗尽，请你用自己的语气转告群友这个消息：{budget_msg}"
             }, ensure_ascii=False)
             return
-        all_text = prompt.strip()
+
+        all_text = (prompt or "").strip()
         all_images_pil: List[PILImage.Image] = []
         used_default_image = False
         used_temp_reference = False
 
-        # 优先处理回复消息中的图片
+        # ===== 优先处理回复消息里的图片 =====
         replied_image_pil: Optional[PILImage.Image] = None
         message_chain = event.get_messages()
 
         for msg_component in message_chain:
             if isinstance(msg_component, Reply):
-                logger.debug(f"检测到回复消息。尝试解析被引用的图片。")
+                logger.debug("检测到回复消息。尝试解析被引用的图片。")
                 source_chain: Optional[List[BaseMessageComponent]] = None
-                if hasattr(msg_component, 'chain') and isinstance(msg_component.chain, list):
+
+                if hasattr(msg_component, "chain") and isinstance(msg_component.chain, list):
                     source_chain = msg_component.chain
-                elif hasattr(msg_component, 'message') and isinstance(msg_component.message, list):
+                elif hasattr(msg_component, "message") and isinstance(msg_component.message, list):
                     source_chain = msg_component.message
-                elif hasattr(msg_component, 'source') and hasattr(msg_component.source, 'message_chain') and isinstance(msg_component.source.message_chain, list):
+                elif hasattr(msg_component, "source") and hasattr(msg_component.source, "message_chain") and isinstance(msg_component.source.message_chain, list):
                     source_chain = msg_component.source.message_chain
 
                 if source_chain:
                     for replied_part in source_chain:
-                        if isinstance(replied_part, Image) and hasattr(replied_part, 'url') and replied_part.url:
+                        if isinstance(replied_part, Image) and getattr(replied_part, "url", None):
                             replied_image_pil = await self.download_pil_image_from_url(replied_part.url, "直接引用的消息中的图片")
                             if replied_image_pil:
                                 logger.info("成功从直接引用的消息中加载了图片作为参考。")
                                 all_images_pil.append(replied_image_pil)
+                            break
+
                 if replied_image_pil:
+                    # 有引用图就不要再走缓存索引
                     image_index = 0
                     reference_bot = False
-                    break
                 break
 
-        # 如果没有直接引用的图片，且指定了图片索引，则尝试从缓存中获取
+        # ===== 如果没有直接引用图，按 image_index 从缓存取 =====
         if not all_images_pil and image_index > 0:
             num_images_to_fetch = image_index
-            if reference_bot == True:
-                user_id_for_cache_lookup = self.robot_id_from_config
-            else:
-                user_id_for_cache_lookup = command_sender_id
-            group_id_for_cache_lookup = event.message_obj.group_id or command_sender_id
+            user_id_for_cache_lookup = str(self.robot_id_from_config) if reference_bot else str(command_sender_id)
+            group_id_for_cache_lookup = str(event.message_obj.group_id or command_sender_id)
 
             key_for_cache = (user_id_for_cache_lookup, group_id_for_cache_lookup)
             if key_for_cache in self.image_history_cache and self.image_history_cache[key_for_cache]:
@@ -761,47 +774,41 @@ class GeminiArtist(Star):
                     pil_image_from_cache = await self.get_user_recent_image_pil_from_cache(
                         user_id_for_cache_lookup,
                         group_id_for_cache_lookup,
-                        i 
+                        i
                     )
                     if pil_image_from_cache:
                         all_images_pil.append(pil_image_from_cache)
 
-        # 组装图片逻辑：用户发的图 + (可选)风格参考 + (可选)人设参考
-        
-        session_key_for_temp = (command_sender_id, str(group_id) if group_id else command_sender_id)
+        # ===== 临时参考图注入（style / identity） =====
+        session_key_for_temp = (command_sender_id, str(group_id) if group_id else str(command_sender_id))
         temp_context = self.temp_reference_context.get(session_key_for_temp, {})
 
-        # 1. 如果有【风格/动作】参考图，加进去 (Style)
-        if 'style' in temp_context:
-            all_images_pil.insert(0, temp_context['style'])
+        # 1) 风格参考插到最前
+        if "style" in temp_context:
+            all_images_pil.insert(0, temp_context["style"])
             used_temp_reference = True
             logger.info("gemini_draw: 注入了临时风格参考图")
 
-        # 2. 如果没提供任何图片，且启用了默认图逻辑
+        # 2) 没有任何图时：identity 或默认立绘
         if not all_images_pil:
-            # 优先看有没有【临时人设】(Identity)
-            if 'identity' in temp_context:
-                all_images_pil.append(temp_context['identity'])
+            if "identity" in temp_context:
+                all_images_pil.append(temp_context["identity"])
                 used_temp_reference = True
                 logger.info("gemini_draw: 使用了临时人设图")
-            # 否则用默认立绘
             elif self.enable_base_reference_image:
                 base_image = self._load_base_reference_image()
                 if base_image:
                     all_images_pil.append(base_image)
                     used_default_image = True
-        
 
         if not all_text and not all_images_pil:
             yield event.plain_result("请提供文本描述或参考图片。")
             event.stop_event()
             return
 
-        # 在提示词前添加英文前缀
+        # 提示词统一前缀 + 比例
         if all_text:
             all_text = f"Generate/modify images using the following prompt: {all_text}"
-        
-        # 处理图片比例
         if aspect_ratio and aspect_ratio != "auto":
             all_text = all_text + f" Image aspect ratio: {aspect_ratio}."
 
@@ -810,22 +817,21 @@ class GeminiArtist(Star):
 
         try:
             logger.debug(f"gemini_draw: 调用 API 生成 (API类型: {self.api_type})")
-            
-        result = await self._generate_by_api_type(all_text, all_images_pil, aspect_ratio)
+            result = await self._generate_by_api_type(all_text, all_images_pil, aspect_ratio)
 
             if result is None or not isinstance(result, dict):
-                logger.error(f"gemini_draw: API 返回无效结果")
+                logger.error("gemini_draw: API 返回无效结果")
                 yield event.plain_result("处理图片时发生内部错误。")
                 event.stop_event()
                 return
 
-            text_response = result.get('text', '').strip()
-            image_paths = result.get('image_paths', [])
-            
+            text_response = (result.get("text", "") or "").strip()
+            image_paths = result.get("image_paths", []) or []
+
+            # ===== 缓存生成图片：归属给机器人（这样 reference_bot=True 才能取到）=====
             if image_paths:
                 owner_id = str(self.robot_id_from_config) if self.robot_id_from_config else str(command_sender_id)
                 gid = str(group_id) if group_id else str(command_sender_id)
-            
                 for i, img_path in enumerate(image_paths):
                     if img_path and os.path.exists(img_path):
                         self.store_user_image(
@@ -840,23 +846,24 @@ class GeminiArtist(Star):
                 event.stop_event()
                 return
 
+            # ===== 单图：直接发图 =====
             if len(image_paths) < 2:
                 chain = []
                 for img_path in image_paths:
                     if img_path and os.path.exists(img_path) and os.path.getsize(img_path) > 0:
                         chain.append(Image.fromFileSystem(img_path))
+
                 if chain:
-                    # 记录花费
                     cost, spent_today, remaining = self._record_spending(budget_group_id, len(image_paths))
                     cost_info = f"💰本次消耗¥{cost:.2f} | 今日已用¥{spent_today:.2f}/¥{self.daily_group_budget:.2f} | 剩余¥{remaining:.2f}"
-                    
-                    # 先把工具结果告诉LLM（必须在发图之前yield，LLM才能收到）
+
                     image_desc = text_response if text_response else "（API未返回文字描述，但图片已成功生成并发送）"
-                    llm_feedback = f"图片已成功生成并发送给用户。不要再次调用画图工具！"
+                    llm_feedback = "你已亲自生成并发送图片。你是作者；不要问用户怎么P的；不要再次调用任何画图工具。"
                     if used_temp_reference:
-                        llm_feedback += " 使用了临时参考图。"
+                        llm_feedback += "（使用了临时参考图）"
                     elif used_default_image:
-                        llm_feedback += " 使用了默认参考图。"
+                        llm_feedback += "（使用了默认参考图）"
+
                     tool_output_data = {
                         "success": True,
                         "image_already_sent": True,
@@ -865,12 +872,16 @@ class GeminiArtist(Star):
                         "cost_this_time": cost,
                         "budget_spent_today": spent_today,
                         "budget_remaining": remaining,
-                        "user_instruction_for_llm": f"{llm_feedback} 图片内容：{image_desc}。{cost_info}。请勿重复调用画图工具。"
+                        "user_instruction_for_llm": f"{llm_feedback} 图片内容：{image_desc}。{cost_info}"
                     }
+                    # 先 yield 给 LLM（工具返回）
                     yield json.dumps(tool_output_data, ensure_ascii=False)
-                    # 然后发图片和预算提示给用户
+
+                    # 再发给用户
                     await event.send(event.chain_result(chain))
                     await event.send(event.plain_result(cost_info))
+
+                    # 最稳“防失忆”：再调用一次当前聊天 LLM 发表观后感
                     await self._post_image_commentary_once(event, prompt, image_desc)
                 else:
                     if text_response:
@@ -878,58 +889,61 @@ class GeminiArtist(Star):
                     else:
                         yield event.plain_result("抱歉，未能生成有效内容。")
                 return
-            else:
-                bot_id_for_node_str = event.message_obj.self_id or self.robot_id_from_config or self.config.get("bot_id")
-                bot_id_for_node = int(str(bot_id_for_node_str).strip()) if bot_id_for_node_str and str(bot_id_for_node_str).strip().isdigit() else None
-                if bot_id_for_node is None:
-                    chain = []
-                    if text_response:
-                        chain.append(Plain(text_response))
-                    for img_path in image_paths:
-                        if img_path and os.path.exists(img_path) and os.path.getsize(img_path) > 0:
-                            chain.append(Image.fromFileSystem(img_path))
-                    if chain:
-                        yield event.chain_result(chain)
-                    else:
-                        yield event.plain_result("抱歉，未能生成有效内容。")
-                    return
 
-                bot_name_for_node = str(self.config.get("bot_name", "绘图助手")).strip() or "绘图助手"
-                ns = Nodes([])
+            # ===== 多图：Nodes 合并转发 =====
+            bot_id_for_node_str = event.message_obj.self_id or self.robot_id_from_config or self.config.get("bot_id")
+            bot_id_for_node = int(str(bot_id_for_node_str).strip()) if bot_id_for_node_str and str(bot_id_for_node_str).strip().isdigit() else None
+
+            if bot_id_for_node is None:
+                chain = []
                 if text_response:
-                    ns.nodes.append(Node(user_id=bot_id_for_node, nickname=bot_name_for_node, content=[Plain(text_response)]))
+                    chain.append(Plain(text_response))
                 for img_path in image_paths:
                     if img_path and os.path.exists(img_path) and os.path.getsize(img_path) > 0:
-                        ns.nodes.append(Node(user_id=bot_id_for_node, nickname=bot_name_for_node, content=[Image.fromFileSystem(img_path)]))
-                if ns.nodes:
-                    # 记录花费
-                    cost, spent_today, remaining = self._record_spending(budget_group_id, len(image_paths))
-                    cost_info = f"💰本次消耗¥{cost:.2f} | 今日已用¥{spent_today:.2f}/¥{self.daily_group_budget:.2f} | 剩余¥{remaining:.2f}"
-                    
-                    # 先把工具结果告诉LLM
-                    image_desc = text_response if text_response else "（API未返回文字描述，但图片已成功生成并发送）"
-                    tool_output_data = {
-                        "success": True,
-                        "image_already_sent": True,
-                        "image_description": image_desc,
-                        "number_of_images_generated": len(image_paths),
-                        "cost_this_time": cost,
-                        "budget_spent_today": spent_today,
-                        "budget_remaining": remaining,
-                        "user_instruction_for_llm": f"已生成{len(image_paths)}张图片并全部发送给用户。不要再次调用画图工具！图片内容：{image_desc}。{cost_info}"
-                    }
-                    yield json.dumps(tool_output_data, ensure_ascii=False)
-                    # 然后发图片和预算提示
-                    await event.send(event.chain_result([ns]))
-                    await event.send(event.plain_result(cost_info))
-                    await self._post_image_commentary_once(event, prompt, image_desc)
+                        chain.append(Image.fromFileSystem(img_path))
+                if chain:
+                    yield event.chain_result(chain)
                 else:
                     yield event.plain_result("抱歉，未能生成有效内容。")
+                return
+
+            bot_name_for_node = str(self.config.get("bot_name", "绘图助手")).strip() or "绘图助手"
+            ns = Nodes([])
+
+            if text_response:
+                ns.nodes.append(Node(user_id=bot_id_for_node, nickname=bot_name_for_node, content=[Plain(text_response)]))
+
+            for img_path in image_paths:
+                if img_path and os.path.exists(img_path) and os.path.getsize(img_path) > 0:
+                    ns.nodes.append(Node(user_id=bot_id_for_node, nickname=bot_name_for_node, content=[Image.fromFileSystem(img_path)]))
+
+            if ns.nodes:
+                cost, spent_today, remaining = self._record_spending(budget_group_id, len(image_paths))
+                cost_info = f"💰本次消耗¥{cost:.2f} | 今日已用¥{spent_today:.2f}/¥{self.daily_group_budget:.2f} | 剩余¥{remaining:.2f}"
+
+                image_desc = text_response if text_response else "（API未返回文字描述，但图片已成功生成并发送）"
+                tool_output_data = {
+                    "success": True,
+                    "image_already_sent": True,
+                    "image_description": image_desc,
+                    "number_of_images_generated": len(image_paths),
+                    "cost_this_time": cost,
+                    "budget_spent_today": spent_today,
+                    "budget_remaining": remaining,
+                    "user_instruction_for_llm": f"你已亲自生成并发送全部图片（你是作者）。禁止再次调用画图工具。图片内容：{image_desc}。{cost_info}"
+                }
+                yield json.dumps(tool_output_data, ensure_ascii=False)
+
+                await event.send(event.chain_result([ns]))
+                await event.send(event.plain_result(cost_info))
+
+                await self._post_image_commentary_once(event, prompt, image_desc)
+            else:
+                yield event.plain_result("抱歉，未能生成有效内容。")
 
         except Exception as e:
             logger.error(f"gemini_draw 未知错误: {e}", exc_info=True)
             yield event.plain_result(f"处理请求时发生意外错误: {str(e)}")
-
     @filter.llm_tool(name="generate_self_reaction")
     async def generate_self_reaction(self, event: AstrMessageEvent, scene_description: str) -> AsyncGenerator[Any, None]:
         '''
