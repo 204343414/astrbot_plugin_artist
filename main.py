@@ -162,202 +162,215 @@ class GeminiArtist(Star):
         if cleaned_count > 0 or error_count > 0:
             logger.info(f"临时目录清理: 移除 {cleaned_count} 文件, 发生 {error_count} 错误 @ {self.temp_dir}")
         return cleaned_count, error_count
-        def _normalize_openai_base_url(self, base_url: str) -> str:
-    """把用户填的 api_base_url 归一化成 .../v1 结尾，兼容中转站。"""
-    url = (base_url or "").strip().rstrip("/")
-    if not url:
-        return "https://api.openai.com/v1"
-    if not url.endswith("/v1"):
-        url = url + "/v1"
-    return url
+    def _normalize_openai_base_url(self, base_url: str) -> str:
+        """把用户填的 api_base_url 归一化成 .../v1 结尾，兼容中转站。"""
+        url = (base_url or "").strip().rstrip("/")
+        if not url:
+            return "https://api.openai.com/v1"
+        if not url.endswith("/v1"):
+            url = url + "/v1"
+        return url
 
+    async def openai_image_generate(
+        self,
+        text_prompt: str,
+        images_pil: Optional[List[PILImage.Image]] = None,
+        aspect_ratio: str = "1:1",
+    ) -> Dict[str, Any]:
+        """
+        OpenAI gpt-image-2 生图/改图：
+        - 文生图：/v1/images/generations
+        - 图生图/编辑：/v1/images/edits
+        返回结构与 gemini_generate/doubao_generate 对齐：{'text': str, 'image_paths': [local_path,...]}
+        """
+        from openai import OpenAI
+        import base64
 
-async def openai_image_generate(
-    self,
-    text_prompt: str,
-    images_pil: Optional[List[PILImage.Image]] = None,
-    aspect_ratio: str = "1:1",
-) -> Dict[str, Any]:
-    """
-    OpenAI gpt-image-2 生图/改图：
-    - 文生图：POST /v1/images/generations
-    - 图生图/参考图：POST /v1/images/edits
-    返回结构与 gemini_generate/doubao_generate 对齐：{'text': str, 'image_paths': [local_path,...]}
-    """
-    from openai import OpenAI  # 你文件里已 import 了，这里再导入一次更稳
-    import base64
+        if not self.api_keys:
+            raise ValueError("没有配置API密钥 (api_keys)")
 
-    if not self.api_keys:
-        raise ValueError("没有配置API密钥 (api_keys)")
+        images_pil = images_pil or []
 
-    images_pil = images_pil or []
+        # 最稳尺寸：避免不同网关/中转对“任意尺寸”兼容问题
+        # OpenAI 图片指南里常用竖横方三档；quality 支持 auto/low/medium/high。 <!--citation:2-->
+        if aspect_ratio in ("9:16", "3:4"):
+            size = "1024x1536"
+        elif aspect_ratio in ("16:9", "4:3"):
+            size = "1536x1024"
+        else:
+            size = "1024x1024"
 
-    # 你插件的 aspect_ratio 很细，但 OpenAI Images API 最稳的 size 就用三档：
-    # 1:1 -> 1024x1024；横向 -> 1536x1024；竖向 -> 1024x1536
-    # （避免不同版本/网关对“任意尺寸”的兼容差异）
-    if aspect_ratio in ("9:16", "3:4"):
-        size = "1024x1536"
-    elif aspect_ratio in ("16:9", "4:3"):
-        size = "1536x1024"
-    else:
-        size = "1024x1024"
+        quality = str(self.config.get("openai_image_quality", "auto")).strip() or "auto"
 
-    quality = str(self.config.get("openai_image_quality", "auto")).strip() or "auto"
+        base_url = self._normalize_openai_base_url(self.api_base_url_from_config)
+        model = self.model_name_from_config or "gpt-image-2"
 
-    base_url = self._normalize_openai_base_url(self.api_base_url_from_config)
-    model = self.model_name_from_config or "gpt-image-2"
+        key_indices_to_try = list(range(len(self.api_keys)))
+        if self.random_api_key_selection:
+            random.shuffle(key_indices_to_try)
+        else:
+            key_indices_to_try = [
+                (self.current_api_key_index + i) % len(self.api_keys)
+                for i in range(len(self.api_keys))
+            ]
 
-    # key 轮询/随机逻辑沿用你原来的模式
-    key_indices_to_try = list(range(len(self.api_keys)))
-    if self.random_api_key_selection:
-        random.shuffle(key_indices_to_try)
-    else:
-        key_indices_to_try = [(self.current_api_key_index + i) % len(self.api_keys) for i in range(len(self.api_keys))]
+        last_exception = None
 
-    last_exception = None
+        for attempt_num, key_idx_to_use in enumerate(key_indices_to_try):
+            api_key = self.api_keys[key_idx_to_use]
+            try:
+                logger.info(
+                    f"openai_image_generate: 尝试API密钥索引 {key_idx_to_use} "
+                    f"(尝试 {attempt_num + 1}/{len(self.api_keys)})"
+                )
+                logger.info(
+                    f"openai_image_generate: base_url={base_url}, model={model}, size={size}, quality={quality}"
+                )
 
-    for attempt_num, key_idx_to_use in enumerate(key_indices_to_try):
-        api_key = self.api_keys[key_idx_to_use]
-        try:
-            logger.info(f"openai_image_generate: 尝试API密钥索引 {key_idx_to_use} (尝试 {attempt_num + 1}/{len(self.api_keys)})")
-            logger.info(f"openai_image_generate: base_url={base_url}, model={model}, size={size}, quality={quality}")
+                client = OpenAI(api_key=api_key, base_url=base_url)
 
-            client = OpenAI(api_key=api_key, base_url=base_url)
+                # 同步 SDK -> 丢到线程，避免阻塞事件循环
+                if images_pil:
+                    # 参考 OpenAI 图片指南：images.edit + gpt-image-2，返回 data[0].b64_json。 <!--citation:2-->
+                    tmp_files: List[str] = []
+                    file_handles: List[Any] = []
+                    try:
+                        os.makedirs(self.temp_dir, exist_ok=True)
+                        for i, img in enumerate(images_pil):
+                            fp = os.path.join(
+                                self.temp_dir,
+                                f"openai_ref_{time.time()}_{random.randint(100,999)}_{i}.png",
+                            )
+                            img.save(fp, format="PNG")
+                            tmp_files.append(fp)
+                            file_handles.append(open(fp, "rb"))
 
-            # 生成/编辑（同步SDK，放到线程里避免卡事件循环）
-            if images_pil:
-                # 多参考图：官方 Python 示例支持 image=[open(...), open(...)] <!--citation:1-->
-                tmp_files = []
-                file_handles = []
-                try:
-                    os.makedirs(self.temp_dir, exist_ok=True)
-                    for i, img in enumerate(images_pil):
-                        fp = os.path.join(self.temp_dir, f"openai_ref_{time.time()}_{random.randint(100,999)}_{i}.png")
-                        img.save(fp, format="PNG")
-                        tmp_files.append(fp)
-                        file_handles.append(open(fp, "rb"))
+                        def _call_edit():
+                            # 注意：这里不传 mask，做“整体参考图编辑”
+                            return client.images.edit(
+                                model=model,
+                                image=file_handles,
+                                prompt=text_prompt,
+                                size=size,
+                                quality=quality,
+                            )
 
-                    def _call_edit():
-                        return client.images.edit(
+                        rsp = await asyncio.to_thread(_call_edit)
+                    finally:
+                        for fh in file_handles:
+                            try:
+                                fh.close()
+                            except Exception:
+                                pass
+                else:
+                    def _call_gen():
+                        return client.images.generate(
                             model=model,
-                            image=file_handles,
                             prompt=text_prompt,
                             size=size,
                             quality=quality,
                         )
 
-                    rsp = await asyncio.to_thread(_call_edit)
-                finally:
-                    for fh in file_handles:
-                        try:
-                            fh.close()
-                        except Exception:
-                            pass
-            else:
-                # 文生图：官方 Python 示例 client.images.generate(model="gpt-image-2", prompt=...) <!--citation:1-->
-                def _call_gen():
-                    return client.images.generate(
-                        model=model,
-                        prompt=text_prompt,
-                        size=size,
-                        quality=quality,
-                    )
+                    rsp = await asyncio.to_thread(_call_gen)
 
-                rsp = await asyncio.to_thread(_call_gen)
+                if not rsp or not getattr(rsp, "data", None):
+                    raise ValueError("OpenAI 图片API返回空 data")
 
-            # 解析返回：b64_json
-            result = {"text": "", "image_paths": []}
-            if not rsp or not getattr(rsp, "data", None):
-                raise ValueError("OpenAI 图片API返回空 data")
+                item0 = rsp.data[0]
+                b64 = getattr(item0, "b64_json", None) or (
+                    item0.get("b64_json") if isinstance(item0, dict) else None
+                )
+                revised = getattr(item0, "revised_prompt", None) or (
+                    item0.get("revised_prompt") if isinstance(item0, dict) else None
+                )
 
-            item0 = rsp.data[0]
-            b64 = getattr(item0, "b64_json", None) or (item0.get("b64_json") if isinstance(item0, dict) else None)
-            revised = getattr(item0, "revised_prompt", None) or (item0.get("revised_prompt") if isinstance(item0, dict) else None)
+                result = {"text": "", "image_paths": []}
+                if revised:
+                    result["text"] = str(revised).strip()
 
-            if revised:
-                result["text"] = str(revised).strip()
+                if not b64:
+                    raise ValueError("OpenAI 图片API未返回 b64_json")
 
-            if not b64:
-                raise ValueError("OpenAI 图片API未返回 b64_json（可能是 response_format/网关不兼容）")
+                img_bytes = base64.b64decode(b64)
+                os.makedirs(self.temp_dir, exist_ok=True)
+                out_fp = os.path.join(
+                    self.temp_dir, f"openai_gen_{time.time()}_{random.randint(100,999)}.png"
+                )
+                with open(out_fp, "wb") as f:
+                    f.write(img_bytes)
 
-            img_bytes = base64.b64decode(b64)
-            os.makedirs(self.temp_dir, exist_ok=True)
-            out_fp = os.path.join(self.temp_dir, f"openai_gen_{time.time()}_{random.randint(100,999)}.png")
-            with open(out_fp, "wb") as f:
-                f.write(img_bytes)
+                result["image_paths"].append(out_fp)
 
-            result["image_paths"].append(out_fp)
+                if not self.random_api_key_selection:
+                    self.current_api_key_index = (key_idx_to_use + 1) % len(self.api_keys)
 
-            if not self.random_api_key_selection:
-                self.current_api_key_index = (key_idx_to_use + 1) % len(self.api_keys)
+                return result
 
-            return result
+            except Exception as e:
+                last_exception = e
+                logger.error(
+                    f"openai_image_generate: API处理失败 (密钥 {key_idx_to_use}): {e}",
+                    exc_info=True,
+                )
 
+        if last_exception:
+            raise last_exception
+        raise ValueError("openai_image_generate: 所有API密钥均尝试失败。")
+
+    async def _post_image_commentary_once(
+        self,
+        event: AstrMessageEvent,
+        user_prompt: str,
+        image_desc: str,
+    ) -> None:
+        """
+        生图成功后：调用一次“当前会话聊天LLM”让它发观后感（写入对话历史，修复装失忆）。
+        AstrBot 官方推荐：get_current_chat_provider_id + llm_generate。 <!--citation:3-->
+        """
+        if not self.config.get("enable_post_image_commentary", True):
+            return
+
+        try:
+            umo = event.unified_msg_origin
+            provider_id = await self.context.get_current_chat_provider_id(umo=umo)
+
+            commentary_prompt = (
+                "你刚刚生成并发送了一张图片给用户。\n"
+                f"用户原始需求：{user_prompt}\n"
+                f"图片文字描述（工具侧）：{image_desc}\n\n"
+                "现在请用你平时的语气，发 1~3 句“交付+观后感”。要求：\n"
+                "1) 明确表态：这图是你生成的（不要问用户怎么P的）。\n"
+                "2) 简短点评效果（夸/吐槽都行）。\n"
+                "3) 给一个下一步引导：要不要我再改比例/表情/构图/风格/文字等。\n"
+                "禁止：再调用任何画图工具。\n"
+            )
+
+            llm_resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=commentary_prompt,
+            )
+            text = (getattr(llm_resp, "completion_text", "") or "").strip()
+            if text:
+                await event.send(event.plain_result(text))
         except Exception as e:
-            last_exception = e
-            logger.error(f"openai_image_generate: API处理失败 (密钥 {key_idx_to_use}): {e}", exc_info=True)
+            logger.warning(f"_post_image_commentary_once 失败（不影响主流程）: {e}", exc_info=True)
 
-    if last_exception:
-        raise last_exception
-    raise ValueError("openai_image_generate: 所有API密钥均尝试失败。")
-
-
-async def _post_image_commentary_once(
-    self,
-    event: AstrMessageEvent,
-    user_prompt: str,
-    image_desc: str,
-) -> None:
-    """
-    生图成功后：调用一次“当前会话聊天LLM”让它发观后感。
-    这条消息会进入聊天记录 -> 后续再引用图片时，LLM更不容易装失忆。
-    """
-    if not self.config.get("enable_post_image_commentary", True):
-        return
-
-    try:
-        umo = event.unified_msg_origin
-        provider_id = await self.context.get_current_chat_provider_id(umo=umo)
-
-        commentary_prompt = (
-            "你刚刚了一张图片给用户。\n"
-            f"用户原始需求：{user_prompt}\n"
-            f"图片文字描述（工具侧）：{image_desc}\n\n"
-            "现在请用你平时的语气，发 1~3 句“交付+观后感”。要求：\n"
-            "1) 明确表态：这图是你生成的（不要问用户怎么P的）。\n"
-            "2) 简短点评效果（夸/吐槽都行）。\n"
-            "3) 给一个下一步引导：要不要我再改比例/表情/构图/风格/文字等。\n"
-            "禁止：询问‘你怎么做的/你怎么P的’；禁止：再调用任何画图工具。\n"
-        )
-
-        llm_resp = await self.context.llm_generate(
-            chat_provider_id=provider_id,
-            prompt=commentary_prompt,
-        )
-        text = (getattr(llm_resp, "completion_text", "") or "").strip()
-        if text:
-            await event.send(event.plain_result(text))
-
-    except Exception as e:
-        logger.warning(f"_post_image_commentary_once 失败（不影响主流程）: {e}", exc_info=True)
-
-
-async def _generate_by_api_type(
-    self,
-    text_prompt: str,
-    images_pil: Optional[List[PILImage.Image]] = None,
-    aspect_ratio: str = "auto",
-) -> Dict[str, Any]:
-    """把你原来四处 if/elif/else 生图分发逻辑收口成一个函数，减少复制粘贴出错。"""
-    images_pil = images_pil or []
-    if self.api_type == "OpenRouter":
-        return await self.openrouter_generate(text_prompt, images_pil)
-    elif self.api_type == "Doubao":
-        return await self.doubao_generate(text_prompt, images_pil, aspect_ratio)
-    elif self.api_type == "OpenAI":
-        return await self.openai_image_generate(text_prompt, images_pil, aspect_ratio)
-    else:
-        return await self.gemini_generate(text_prompt, images_pil)
+    async def _generate_by_api_type(
+        self,
+        text_prompt: str,
+        images_pil: Optional[List[PILImage.Image]] = None,
+        aspect_ratio: str = "auto",
+    ) -> Dict[str, Any]:
+        """统一入口：减少你四处复制 if/elif/else 出错。"""
+        images_pil = images_pil or []
+        if self.api_type == "OpenRouter":
+            return await self.openrouter_generate(text_prompt, images_pil)
+        elif self.api_type == "Doubao":
+            return await self.doubao_generate(text_prompt, images_pil, aspect_ratio)
+        elif self.api_type == "OpenAI":
+            return await self.openai_image_generate(text_prompt, images_pil, aspect_ratio)
+        else:
+            return await self.gemini_generate(text_prompt, images_pil)
 
     async def _periodic_temp_dir_cleanup(self):
         """
@@ -367,14 +380,15 @@ async def _generate_by_api_type(
             await asyncio.sleep(self.cleanup_interval_seconds)
             logger.info(f"定时清理触发: {self.temp_dir}")
             try:
-                cleanup_func = functools.partial(self._blocking_cleanup_temp_dir_logic, self.cleanup_older_than_seconds)
+                cleanup_func = functools.partial(
+                    self._blocking_cleanup_temp_dir_logic, self.cleanup_older_than_seconds
+                )
                 await asyncio.to_thread(cleanup_func)
             except asyncio.CancelledError:
                 logger.info("定时清理任务已取消。")
                 break
             except Exception as e:
                 logger.error(f"定时清理任务出错: {e}", exc_info=True)
-
     def store_user_image(self, user_id: str, group_id: str, image_url: str, original_filename: Optional[str] = None) -> None:
         """
         将用户发送的图片URL存储到缓存中。
