@@ -3,12 +3,12 @@
         "description": "API类型",
         "type": "string",
         "hint": "选择使用的API类型",
-        "default": "Google",
-        "options": [
-            "Google",
-            "OpenRouter",
-            "Doubao"
-        ]
+		"options": [
+		  "Google",
+		  "OpenRouter",
+		  "Doubao",
+		  "OpenAI"
+		]
     },
 	    "api_key": {
         "description": "API密钥列表",
@@ -98,5 +98,17 @@
         "title": "每张图预估成本(元)",
         "description": "每生成一张图片的预估API成本(人民币)",
         "default": 0.2
-    }
+    },
+	"enable_post_image_commentary": {
+  "type": "bool",
+  "title": "生图后自动发观后感",
+  "description": "生图发送成功后，再调用一次当前聊天LLM发一段“交付/观后感”，用于修复bot不记得自己生过图。",
+  "default": true
+	},
+"openai_image_quality": {
+  "type": "string",
+  "title": "OpenAI 生图质量",
+  "description": "gpt-image-2 的质量：auto/low/medium/high",
+  "default": "auto"
+	}
 }
