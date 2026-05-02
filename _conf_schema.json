@@ -1,141 +1,102 @@
 {
-  "title_max_length": {
-    "description": "标题最大长度",
-    "type": "int",
-    "default": 60
-  },
-  "description_max_length": {
-    "description": "描述最大长度",
-    "type": "int",
-    "default": 200
-  },
-  "max_items_per_poll": {
-    "description": "每次轮询最大条目数",
-    "type": "int",
-    "default": 5
-  },
-  "t2i": {
-    "description": "是否使用文字转图片",
-    "type": "bool",
-    "default": false
-  },
-  "is_hide_url": {
-    "description": "是否隐藏链接",
-    "type": "bool",
-    "default": false
-  },
-  "is_read_pic": {
-    "description": "是否读取图片",
-    "type": "bool",
-    "default": true
-  },
-  "is_adjust_pic": {
-    "description": "图片防和谐",
-    "type": "bool",
-    "default": false
-  },
-  "max_pic_item": {
-    "description": "最大图片数(-1不限)",
-    "type": "int",
-    "default": 3
-  },
-  "compose": {
-    "description": "QQ平台合并转发",
-    "type": "bool",
-    "default": true
-  },
-  "enable_comment": {
-    "description": "是否开启AI锐评（推送时bot用人设评论动态内容）",
-    "type": "bool",
-    "default": true
-  },
-  "comment_provider_id": {
-    "description": "锐评用的LLM提供商（留空则用默认）",
-    "type": "string",
-    "default": "",
-    "_special": "select_provider"
-  },
-  "comment_persona": {
-    "description": "锐评用的人格（留空则用默认人格）",
-    "type": "string",
-    "default": "",
-    "_special": "select_persona"
-  },
-  "comment_max_length": {
-    "description": "锐评最大字数",
-    "type": "int",
-    "default": 80
-  },
-  "bot_qq": {
-    "description": "Bot的QQ号（用于显示头像）",
-    "type": "string",
-    "default": ""
-  },
-  "bot_provider_name": {
-    "description": "Bot使用的服务商名称（显示在锐评旁边）",
-    "type": "string",
-    "default": ""
-  },
-  "content_filter": {
-    "description": "是否过滤不适合推送的内容（反动/暴力/涩情等）",
-    "type": "bool",
-    "default": true
-  },
-  "filter_provider_id": {
-    "description": "内容过滤用的LLM（建议选便宜快速的）",
-    "type": "string",
-    "default": "",
-    "_special": "select_provider"
-  },
-  "image_caption_provider_id": {
-    "description": "识图用的LLM（如gemini）",
-    "type": "string",
-    "default": "",
-    "_special": "select_provider"
-  },
-  "global_feeds": {
-    "description": "全局订阅源（推给所有活跃群），每行一个RSSHub路由，如 /twitter/user/elonmusk",
-    "type": "text",
-    "default": ""
-  },
-  "global_feed_interval": {
-    "description": "全局订阅基础检查间隔（分钟）",
-    "type": "int",
-    "default": 15
-  },
-  "global_feed_max_interval": {
-    "description": "全局订阅最大检查间隔（分钟），退避上限",
-    "type": "int",
-    "default": 1440
-  },
-  "push_delay_min": {
-    "description": "推送间隔最小秒数（防风控）",
-    "type": "float",
-    "default": 5.0
-  },
-  "push_delay_max": {
-    "description": "推送间隔最大秒数（防风控）",
-    "type": "float",
-    "default": 8.0
-  },
-  "safe_mode": {
-    "description": "安全模式：开启后全局推送只发到测试群，不发其他群",
-    "type": "bool",
-    "default": true
-  },
-  "safe_mode_groups": {
-    "description": "安全模式测试群号（多个用逗号分隔，如 123456,789012）",
-    "type": "string",
-    "default": ""
-  },
-  "group_cooldown_minutes": {
-    "description": "全局推送冷却期（分钟）：同一个群在此时间内最多收到一次全局推送",
-    "type": "int",
-    "default": 60
-  },
-  "browserless_url": {
-    "description": "Browserless 截图服务地址（Docker容器名:端口）",
-    "type": "string",
-    "default": "http://browserless:3000"
-  }
+    "api_type": {
+        "description": "API类型",
+        "type": "string",
+        "hint": "选择使用的API类型",
+        "default": "Google",
+        "options": [
+            "Google",
+            "OpenRouter",
+            "Doubao"
+        ]
+    },
+	    "api_key": {
+        "description": "API密钥列表",
+        "type": "list",
+        "hint": "填写API密钥，支持多个",
+        "default": []
+    },
+    "api_base_url": {
+        "description": "API地址",
+        "type": "string",
+        "hint": "如 https://aiping.cn/api/v1 或 https://generativelanguage.googleapis.com",
+        "default": "https://generativelanguage.googleapis.com"
+    },
+    "model": {
+        "description": "模型名称",
+        "type": "string",
+        "hint": "如 Doubao-Seedream-4.5 或 gemini-2.0-flash-exp",
+        "default": "gemini-2.0-flash-exp"
+    },
+    "enable_hinting": {
+        "description": "是否启用生图时提示",
+        "type": "bool",
+        "default": true
+    },
+    "max_cached_images": {
+        "description": "缓存的图片数量最大值",
+        "type": "int",
+        "default": 5
+    },
+    "robot_self_id": {
+        "type": "string",
+        "title": "机器人自身ID",
+        "description": "机器人平台的用户ID，用于识别机器人自身消息",
+        "default": ""
+    },
+    "group_whitelist": {
+        "type": "list",
+        "title": "群聊白名单",
+        "description": "允许使用绘图功能的群聊ID或用户ID列表。为空则不限制。",
+        "default": []
+    },
+    "wait_time": {
+        "type": "int",
+        "description": "/draw 指令的等待时间（秒）",
+        "default": 30,
+        "min": 10
+    },
+    "temp_cleanup_interval_seconds": {
+        "type": "int",
+        "description": "定时清理临时目录的间隔（秒），0为禁用",
+        "default": 21600,
+        "min": 0
+    },
+    "temp_cleanup_files_older_than_seconds": {
+        "type": "int",
+        "description": "清理超过此时长（秒）的临时文件",
+        "default": 259200,
+        "min": 3600
+    },
+    "enable_self_reaction": {
+        "type": "bool",
+        "title": "启用角色反应图功能",
+        "description": "启用后，LLM可在互动场景生成角色自身的表情包/反应图",
+        "default": false
+    },
+    "character_image_path": {
+        "type": "string",
+        "title": "角色人设参考图路径",
+        "description": "角色形象参考图的路径，用于生成角色反应图",
+        "hint": "例如: data/plugins/astrbot_plugin_gemini_artist/character/persona.png",
+        "default": ""
+    },
+    "enable_self_reaction_review": {
+        "type": "bool",
+        "title": "启用反应图自审",
+        "description": "生成后让LLM检查图片质量，不通过则静默不发送",
+        "default": true
+    },
+        "daily_group_budget": {
+        "type": "float",
+        "title": "每群每日画图预算(元)",
+        "description": "每个群每天的画图API预算上限(人民币)。0表示不限制。",
+        "default": 5.0
+    },
+    "cost_per_image": {
+        "type": "float",
+        "title": "每张图预估成本(元)",
+        "description": "每生成一张图片的预估API成本(人民币)",
+        "default": 0.2
+    }
 }
