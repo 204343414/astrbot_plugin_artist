@@ -162,6 +162,202 @@ class GeminiArtist(Star):
         if cleaned_count > 0 or error_count > 0:
             logger.info(f"临时目录清理: 移除 {cleaned_count} 文件, 发生 {error_count} 错误 @ {self.temp_dir}")
         return cleaned_count, error_count
+        def _normalize_openai_base_url(self, base_url: str) -> str:
+    """把用户填的 api_base_url 归一化成 .../v1 结尾，兼容中转站。"""
+    url = (base_url or "").strip().rstrip("/")
+    if not url:
+        return "https://api.openai.com/v1"
+    if not url.endswith("/v1"):
+        url = url + "/v1"
+    return url
+
+
+async def openai_image_generate(
+    self,
+    text_prompt: str,
+    images_pil: Optional[List[PILImage.Image]] = None,
+    aspect_ratio: str = "1:1",
+) -> Dict[str, Any]:
+    """
+    OpenAI gpt-image-2 生图/改图：
+    - 文生图：POST /v1/images/generations
+    - 图生图/参考图：POST /v1/images/edits
+    返回结构与 gemini_generate/doubao_generate 对齐：{'text': str, 'image_paths': [local_path,...]}
+    """
+    from openai import OpenAI  # 你文件里已 import 了，这里再导入一次更稳
+    import base64
+
+    if not self.api_keys:
+        raise ValueError("没有配置API密钥 (api_keys)")
+
+    images_pil = images_pil or []
+
+    # 你插件的 aspect_ratio 很细，但 OpenAI Images API 最稳的 size 就用三档：
+    # 1:1 -> 1024x1024；横向 -> 1536x1024；竖向 -> 1024x1536
+    # （避免不同版本/网关对“任意尺寸”的兼容差异）
+    if aspect_ratio in ("9:16", "3:4"):
+        size = "1024x1536"
+    elif aspect_ratio in ("16:9", "4:3"):
+        size = "1536x1024"
+    else:
+        size = "1024x1024"
+
+    quality = str(self.config.get("openai_image_quality", "auto")).strip() or "auto"
+
+    base_url = self._normalize_openai_base_url(self.api_base_url_from_config)
+    model = self.model_name_from_config or "gpt-image-2"
+
+    # key 轮询/随机逻辑沿用你原来的模式
+    key_indices_to_try = list(range(len(self.api_keys)))
+    if self.random_api_key_selection:
+        random.shuffle(key_indices_to_try)
+    else:
+        key_indices_to_try = [(self.current_api_key_index + i) % len(self.api_keys) for i in range(len(self.api_keys))]
+
+    last_exception = None
+
+    for attempt_num, key_idx_to_use in enumerate(key_indices_to_try):
+        api_key = self.api_keys[key_idx_to_use]
+        try:
+            logger.info(f"openai_image_generate: 尝试API密钥索引 {key_idx_to_use} (尝试 {attempt_num + 1}/{len(self.api_keys)})")
+            logger.info(f"openai_image_generate: base_url={base_url}, model={model}, size={size}, quality={quality}")
+
+            client = OpenAI(api_key=api_key, base_url=base_url)
+
+            # 生成/编辑（同步SDK，放到线程里避免卡事件循环）
+            if images_pil:
+                # 多参考图：官方 Python 示例支持 image=[open(...), open(...)] <!--citation:1-->
+                tmp_files = []
+                file_handles = []
+                try:
+                    os.makedirs(self.temp_dir, exist_ok=True)
+                    for i, img in enumerate(images_pil):
+                        fp = os.path.join(self.temp_dir, f"openai_ref_{time.time()}_{random.randint(100,999)}_{i}.png")
+                        img.save(fp, format="PNG")
+                        tmp_files.append(fp)
+                        file_handles.append(open(fp, "rb"))
+
+                    def _call_edit():
+                        return client.images.edit(
+                            model=model,
+                            image=file_handles,
+                            prompt=text_prompt,
+                            size=size,
+                            quality=quality,
+                        )
+
+                    rsp = await asyncio.to_thread(_call_edit)
+                finally:
+                    for fh in file_handles:
+                        try:
+                            fh.close()
+                        except Exception:
+                            pass
+            else:
+                # 文生图：官方 Python 示例 client.images.generate(model="gpt-image-2", prompt=...) <!--citation:1-->
+                def _call_gen():
+                    return client.images.generate(
+                        model=model,
+                        prompt=text_prompt,
+                        size=size,
+                        quality=quality,
+                    )
+
+                rsp = await asyncio.to_thread(_call_gen)
+
+            # 解析返回：b64_json
+            result = {"text": "", "image_paths": []}
+            if not rsp or not getattr(rsp, "data", None):
+                raise ValueError("OpenAI 图片API返回空 data")
+
+            item0 = rsp.data[0]
+            b64 = getattr(item0, "b64_json", None) or (item0.get("b64_json") if isinstance(item0, dict) else None)
+            revised = getattr(item0, "revised_prompt", None) or (item0.get("revised_prompt") if isinstance(item0, dict) else None)
+
+            if revised:
+                result["text"] = str(revised).strip()
+
+            if not b64:
+                raise ValueError("OpenAI 图片API未返回 b64_json（可能是 response_format/网关不兼容）")
+
+            img_bytes = base64.b64decode(b64)
+            os.makedirs(self.temp_dir, exist_ok=True)
+            out_fp = os.path.join(self.temp_dir, f"openai_gen_{time.time()}_{random.randint(100,999)}.png")
+            with open(out_fp, "wb") as f:
+                f.write(img_bytes)
+
+            result["image_paths"].append(out_fp)
+
+            if not self.random_api_key_selection:
+                self.current_api_key_index = (key_idx_to_use + 1) % len(self.api_keys)
+
+            return result
+
+        except Exception as e:
+            last_exception = e
+            logger.error(f"openai_image_generate: API处理失败 (密钥 {key_idx_to_use}): {e}", exc_info=True)
+
+    if last_exception:
+        raise last_exception
+    raise ValueError("openai_image_generate: 所有API密钥均尝试失败。")
+
+
+async def _post_image_commentary_once(
+    self,
+    event: AstrMessageEvent,
+    user_prompt: str,
+    image_desc: str,
+) -> None:
+    """
+    生图成功后：调用一次“当前会话聊天LLM”让它发观后感。
+    这条消息会进入聊天记录 -> 后续再引用图片时，LLM更不容易装失忆。
+    """
+    if not self.config.get("enable_post_image_commentary", True):
+        return
+
+    try:
+        umo = event.unified_msg_origin
+        provider_id = await self.context.get_current_chat_provider_id(umo=umo)
+
+        commentary_prompt = (
+            "你刚刚了一张图片给用户。\n"
+            f"用户原始需求：{user_prompt}\n"
+            f"图片文字描述（工具侧）：{image_desc}\n\n"
+            "现在请用你平时的语气，发 1~3 句“交付+观后感”。要求：\n"
+            "1) 明确表态：这图是你生成的（不要问用户怎么P的）。\n"
+            "2) 简短点评效果（夸/吐槽都行）。\n"
+            "3) 给一个下一步引导：要不要我再改比例/表情/构图/风格/文字等。\n"
+            "禁止：询问‘你怎么做的/你怎么P的’；禁止：再调用任何画图工具。\n"
+        )
+
+        llm_resp = await self.context.llm_generate(
+            chat_provider_id=provider_id,
+            prompt=commentary_prompt,
+        )
+        text = (getattr(llm_resp, "completion_text", "") or "").strip()
+        if text:
+            await event.send(event.plain_result(text))
+
+    except Exception as e:
+        logger.warning(f"_post_image_commentary_once 失败（不影响主流程）: {e}", exc_info=True)
+
+
+async def _generate_by_api_type(
+    self,
+    text_prompt: str,
+    images_pil: Optional[List[PILImage.Image]] = None,
+    aspect_ratio: str = "auto",
+) -> Dict[str, Any]:
+    """把你原来四处 if/elif/else 生图分发逻辑收口成一个函数，减少复制粘贴出错。"""
+    images_pil = images_pil or []
+    if self.api_type == "OpenRouter":
+        return await self.openrouter_generate(text_prompt, images_pil)
+    elif self.api_type == "Doubao":
+        return await self.doubao_generate(text_prompt, images_pil, aspect_ratio)
+    elif self.api_type == "OpenAI":
+        return await self.openai_image_generate(text_prompt, images_pil, aspect_ratio)
+    else:
+        return await self.gemini_generate(text_prompt, images_pil)
 
     async def _periodic_temp_dir_cleanup(self):
         """
@@ -191,73 +387,97 @@ class GeminiArtist(Star):
 
     async def download_pil_image_from_url(self, image_url: str, context_description: str = "图片") -> Optional[PILImage.Image]:
         """
-        从给定的URL下载图片并返回PIL Image对象。
+        从给定的 URL/本地路径/dataURL/fileURL 获取图片并返回 PIL Image(RGBA)。
+        兼容：
+        - http(s)://...
+        - data:image/...;base64,...
+        - 本地路径：D:\\xx\\a.png 或 /home/xx/a.png
+        - file://D:\\xx\\a.png 或 file:///D:/xx/a.png
         """
-        logger.info(f"尝试使用 astrbot.core.utils.io.download_file 下载 {context_description} URL: {image_url}")
-
-        # 尝试从URL中获取文件扩展名
+        from urllib.parse import unquote
+    
+        if not image_url or not isinstance(image_url, str):
+            return None
+    
+        image_url = image_url.strip()
+        logger.info(f"尝试加载{context_description}: {image_url[:200]}")
+    
+        # 1) data url
+        if image_url.startswith("data:image"):
+            try:
+                header, encoded = image_url.split(",", 1)
+                image_bytes = base64.b64decode(encoded)
+                img_pil = PILImage.open(BytesIO(image_bytes))
+                img_pil.load()
+                return img_pil.convert("RGBA") if img_pil.mode != "RGBA" else img_pil
+            except Exception as e:
+                logger.error(f"Data URL 解码失败: {e}", exc_info=True)
+                return None
+    
+        # 2) file:// url  -> 本地路径
+        if image_url.lower().startswith("file://"):
+            try:
+                local_path = unquote(image_url[7:])  # 去掉 file://
+                # 兼容 file:///D:/xxx 这种
+                if local_path.startswith("/") and len(local_path) >= 3 and local_path[2] == ":":
+                    local_path = local_path[1:]
+                local_path = local_path.replace("/", os.sep)
+    
+                if os.path.exists(local_path) and os.path.isfile(local_path):
+                    img_pil = PILImage.open(local_path)
+                    img_pil.load()
+                    return img_pil.convert("RGBA") if img_pil.mode != "RGBA" else img_pil
+    
+                logger.warning(f"file:// 指向的本地文件不存在: {local_path}")
+                return None
+            except Exception as e:
+                logger.error(f"解析 file:// 失败: {e}", exc_info=True)
+                return None
+    
+        # 3) 直接本地路径
+        if os.path.exists(image_url) and os.path.isfile(image_url):
+            try:
+                img_pil = PILImage.open(image_url)
+                img_pil.load()
+                return img_pil.convert("RGBA") if img_pil.mode != "RGBA" else img_pil
+            except Exception as e:
+                logger.error(f"加载本地图片失败: {e}", exc_info=True)
+                return None
+    
+        # 4) http(s) 下载
+        if not (image_url.startswith("http://") or image_url.startswith("https://")):
+            logger.warning(f"未知图片引用格式，无法处理: {image_url[:120]}")
+            return None
+    
+        # ===== 以下保留你原来的 download_file 逻辑（精简版）=====
         ext = ".png"
         try:
-            path_part = image_url.split('?')[0].split('#')[0]
+            path_part = image_url.split("?")[0].split("#")[0]
             base_name = os.path.basename(path_part)
             _, url_ext = os.path.splitext(base_name)
-            if url_ext and url_ext.startswith('.') and len(url_ext) <= 5:
+            if url_ext and url_ext.startswith(".") and len(url_ext) <= 5:
                 ext = url_ext.lower()
-            elif image_url.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif')):
-                for known_ext in ['.jpg', '.jpeg', '.png', '.webp', '.gif']:
-                    if image_url.lower().endswith(known_ext):
-                        ext = known_ext
-                        break
-        except Exception as e_ext:
-            logger.debug(f"从URL {image_url} 获取扩展名时出错: {e_ext}，使用默认扩展名 {ext}")
-
+        except Exception:
+            pass
+    
         filename = f"gemini_artist_temp_{time.time()}_{random.randint(1000,9999)}{ext}"
         target_file_path = os.path.join(self.temp_dir, filename)
-
         os.makedirs(self.temp_dir, exist_ok=True)
-
+    
         try:
             await download_file(url=image_url, path=target_file_path, show_progress=False)
-
-            if os.path.exists(target_file_path) and os.path.isfile(target_file_path) and os.path.getsize(target_file_path) > 0:
+    
+            if os.path.exists(target_file_path) and os.path.getsize(target_file_path) > 0:
                 img_pil = PILImage.open(target_file_path)
                 img_pil.load()
-                if img_pil.mode != 'RGBA':
-                    img_pil = img_pil.convert('RGBA')
-                logger.info(f"图片从 {img_pil.mode} 转换为 RGBA 模式: {target_file_path}")
-
-
-                logger.info(f"成功使用 download_file 下载并加载 {context_description} 从 {image_url} (本地文件: {target_file_path})")
-                return img_pil
-            else:
-                logger.error(f"download_file 声称完成，但在路径 '{target_file_path}' 未找到有效文件或文件为空。URL: {image_url}")
-                if os.path.exists(target_file_path):
-                    try:
-                        os.remove(target_file_path)
-                    except Exception:
-                        pass
-                return None
-
-        except FileNotFoundError:
-            logger.error(f"尝试写入下载文件时发生 FileNotFoundError，请检查临时目录 '{self.temp_dir}' 是否有效且可写。 URL: {image_url}", exc_info=True)
+                return img_pil.convert("RGBA") if img_pil.mode != "RGBA" else img_pil
+    
+            logger.error(f"download_file 下载后文件无效: {target_file_path}")
             return None
-        except PILImage.UnidentifiedImageError:
-            logger.error(f"Pillow无法识别下载的图片文件 {target_file_path}。可能不是有效的图片格式或文件已损坏。 URL: {image_url}", exc_info=True)
-            if os.path.exists(target_file_path):
-                try:
-                    os.remove(target_file_path)
-                except Exception as e_rem:
-                    logger.warning(f"清理无效下载文件 {target_file_path} 失败: {e_rem}")
-            return None
+    
         except Exception as e:
-            logger.error(f"调用 download_file(url='{image_url}', path='{target_file_path}') 时发生错误: {type(e).__name__} - {e}", exc_info=True)
-            if os.path.exists(target_file_path) and os.path.getsize(target_file_path) == 0:
-                try:
-                    os.remove(target_file_path)
-                except Exception:
-                    pass
+            logger.error(f"HTTP 下载图片失败: {e}", exc_info=True)
             return None
-
     def _load_base_reference_image(self) -> Optional[PILImage.Image]:
         """
         从配置的路径加载默认的基础参考图。
@@ -379,6 +599,7 @@ class GeminiArtist(Star):
 - 严格保持角色外貌与参考图绝对一致！！！
 - 图中不要出现任何文字
 - 氛围可以是可爱、搞笑、温馨、或擦边"""
+    
     async def get_user_recent_image_pil_from_cache(self, user_id: str, group_id: str, index: int = 1) -> Optional[PILImage.Image]:
         """
         从用户图片缓存中获取指定索引的图片并下载为PIL Image对象。
@@ -576,12 +797,7 @@ class GeminiArtist(Star):
         try:
             logger.debug(f"gemini_draw: 调用 API 生成 (API类型: {self.api_type})")
             
-            if self.api_type == "OpenRouter":
-                result = await self.openrouter_generate(all_text, all_images_pil)
-            elif self.api_type == "Doubao":
-                result = await self.doubao_generate(all_text, all_images_pil, aspect_ratio)
-            else:
-                result = await self.gemini_generate(all_text, all_images_pil)
+        result = await self._generate_by_api_type(all_text, all_images_pil, aspect_ratio)
 
             if result is None or not isinstance(result, dict):
                 logger.error(f"gemini_draw: API 返回无效结果")
@@ -593,13 +809,16 @@ class GeminiArtist(Star):
             image_paths = result.get('image_paths', [])
             
             if image_paths:
+                owner_id = str(self.robot_id_from_config) if self.robot_id_from_config else str(command_sender_id)
+                gid = str(group_id) if group_id else str(command_sender_id)
+            
                 for i, img_path in enumerate(image_paths):
-                    if os.path.exists(img_path):
+                    if img_path and os.path.exists(img_path):
                         self.store_user_image(
-                            command_sender_id,
-                            group_id,
+                            owner_id,
+                            gid,
                             img_path,
-                            f"gemini_generated_{i+1}_{os.path.basename(img_path)}"
+                            f"generated_{i+1}_{os.path.basename(img_path)}"
                         )
 
             if not text_response and not image_paths:
@@ -638,6 +857,7 @@ class GeminiArtist(Star):
                     # 然后发图片和预算提示给用户
                     await event.send(event.chain_result(chain))
                     await event.send(event.plain_result(cost_info))
+                    await self._post_image_commentary_once(event, prompt, image_desc)
                 else:
                     if text_response:
                         yield event.plain_result(text_response)
@@ -688,6 +908,7 @@ class GeminiArtist(Star):
                     # 然后发图片和预算提示
                     await event.send(event.chain_result([ns]))
                     await event.send(event.plain_result(cost_info))
+                    await self._post_image_commentary_once(event, prompt, image_desc)
                 else:
                     yield event.plain_result("抱歉，未能生成有效内容。")
 
@@ -793,12 +1014,7 @@ class GeminiArtist(Star):
             logger.info(f"generate_self_reaction: 开始生成，场景: {scene_description[:50]}...")
             
             # 根据API类型调用生成
-            if self.api_type == "OpenRouter":
-                result = await self.openrouter_generate(final_prompt, images_for_api)
-            elif self.api_type == "Doubao":
-                result = await self.doubao_generate(final_prompt, images_for_api, "3:4")  # 人物图用竖向
-            else:
-                result = await self.gemini_generate(final_prompt, images_for_api)
+            result = await self._generate_by_api_type(final_prompt, images_for_api, "3:4")
 
             if not result or not isinstance(result, dict):
                 logger.error("generate_self_reaction: API返回无效")
@@ -851,6 +1067,7 @@ class GeminiArtist(Star):
             chain = [Image.fromFileSystem(image_path)]
             await event.send(event.chain_result(chain))
             await event.send(event.plain_result(cost_info))
+            await self._post_image_commentary_once(event, scene_description, f"角色反应图场景：{scene_description}")
 
         except Exception as e:
             logger.error(f"generate_self_reaction 错误: {e}", exc_info=True)
@@ -996,12 +1213,7 @@ class GeminiArtist(Star):
             final_prompt = f"参考图1是角色形象参考。" + final_prompt
 
         try:
-            if self.api_type == "OpenRouter":
-                result = await self.openrouter_generate(final_prompt, images_for_api)
-            elif self.api_type == "Doubao":
-                result = await self.doubao_generate(final_prompt, images_for_api, "1:1")
-            else:
-                result = await self.gemini_generate(final_prompt, images_for_api)
+            result = await self._generate_by_api_type(final_prompt, images_for_api, "1:1")
 
             if not result or not result.get('image_paths'):
                 yield json.dumps({"success": False, "message": "图片合并生成失败"}, ensure_ascii=False)
@@ -1036,7 +1248,7 @@ class GeminiArtist(Star):
             # 然后发图片
             await event.send(event.chain_result(chain))
             await event.send(event.plain_result(cost_info))
-
+            await self._post_image_commentary_once(event, prompt, "多图合并结果已发送")
         except Exception as e:
             logger.error(f"combine_images_draw 错误: {e}", exc_info=True)
             yield json.dumps({"success": False, "message": "合并过程出错"}, ensure_ascii=False)    
@@ -1229,13 +1441,7 @@ class GeminiArtist(Star):
             
             try:
                 # 根据API类型调用相应的生成方法
-                if self.api_type == "OpenRouter":
-                    api_result = await self.openrouter_generate(final_prompt_text, all_pil_images_for_api)
-                elif self.api_type == "Doubao":
-                    api_result = await self.doubao_generate(final_prompt_text, all_pil_images_for_api, "auto")
-                else:
-                    # 默认使用 Google Gemini API
-                    api_result = await self.gemini_generate(final_prompt_text, all_pil_images_for_api)
+                api_result = await self._generate_by_api_type(final_prompt_text, all_pil_images_for_api, "auto")
                 
                 if api_result is None or not isinstance(api_result, dict): # Should be caught by gemini_generate raising error
                     logger.error(f"collect_user_inputs: gemini_generate 返回无效结果 for /draw session: {type(api_result)}")
