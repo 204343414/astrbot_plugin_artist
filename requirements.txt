@@ -1,5 +1,0 @@
-aiohttp
-lxml
-beautifulsoup4
-Pillow>=8.2.0
-apscheduler
