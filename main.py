@@ -493,43 +493,49 @@ class GeminiArtist(Star):
             logger.error(f"HTTP 下载图片失败: {e}", exc_info=True)
             return None
     def _load_base_reference_image(self) -> Optional[PILImage.Image]:
-        """
-        从配置的路径加载默认的基础参考图。
-        """
         if not self.base_reference_image_path:
             return None
 
-        # 将路径相对于 AstrBot 根目录解析
-        astrbot_root = Path(__file__).resolve().parent.parent.parent.parent
+        plugin_dir = Path(__file__).resolve().parent
         image_path = Path(self.base_reference_image_path)
+
         if not image_path.is_absolute():
-            image_path = astrbot_root / image_path
+            candidate = plugin_dir / image_path
+            if candidate.exists() and candidate.is_file():
+                image_path = candidate
+            else:
+                astrbot_root = plugin_dir.parent.parent.parent
+                image_path = astrbot_root / image_path
 
         if image_path.exists() and image_path.is_file():
             try:
                 logger.info(f"正在加载默认参考图: {image_path}")
                 img_pil = PILImage.open(image_path)
-                img_pil.load()  # 确保图片数据已加载
-                # 转换为RGBA以获得最佳兼容性
+                img_pil.load()
                 return img_pil.convert('RGBA') if img_pil.mode != 'RGBA' else img_pil
             except Exception as e:
                 logger.error(f"加载默认参考图失败: {image_path}, 错误: {e}")
                 return None
         else:
-            logger.warning(f"配置的默认参考图路径不存在或不是一个文件: {image_path}")
+            logger.warning(f"配置的默认参考图路径不存在: {image_path}")
             return None
     def _load_character_reference_image(self) -> Optional[PILImage.Image]:
-        """
-        加载角色人设参考图（用于反应图功能）。
-        """
         if not self.character_image_path:
             logger.warning("角色人设参考图路径未配置 (character_image_path)")
             return None
 
-        astrbot_root = Path(__file__).resolve().parent.parent.parent.parent
+        plugin_dir = Path(__file__).resolve().parent
         image_path = Path(self.character_image_path)
+
         if not image_path.is_absolute():
-            image_path = astrbot_root / image_path
+            # 优先：相对于插件自身目录（Docker 里最稳）
+            candidate = plugin_dir / image_path
+            if candidate.exists() and candidate.is_file():
+                image_path = candidate
+            else:
+                # 兜底：相对于 AstrBot data 根目录（即 plugins 的上三级）
+                astrbot_root = plugin_dir.parent.parent.parent
+                image_path = astrbot_root / image_path
 
         if image_path.exists() and image_path.is_file():
             try:
