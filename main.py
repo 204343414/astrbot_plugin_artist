@@ -953,8 +953,8 @@ class GeminiArtist(Star):
     @filter.llm_tool(name="generate_self_reaction")
     async def generate_self_reaction(self, event: AstrMessageEvent, scene_description: str) -> AsyncGenerator[Any, None]:
         '''
-        对方希望画你自己时优先调用此画图工具而不是使用draw，用于魔改或表情包等。诸如与用户进行互动整活时使用。
-        该函数会自动使用你角色的参考图，比文字提示词精确，你只需描述场景，不要额外描述外貌特征。同时要提醒告知用户，画图API非常昂贵。
+        对方希望画与你自己相关或客串的图时优先调用此画图工具而不是使用draw，用于魔改或表情包等。诸如与用户进行互动整活时使用。
+        该函数会自动使用你角色的参考图，比文字提示词精确，你只需描述场景，不要额外描述外貌特征。
 
         Args:
             scene_description (string): 画面描述。包括你的表情、情绪、动作、与对方当前的互动等。
