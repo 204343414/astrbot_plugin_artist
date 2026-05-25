@@ -138,6 +138,19 @@ class GeminiArtist(Star):
         remaining = round(max(0, self.daily_group_budget - spent_today), 2)
         logger.info(f"预算记录: 群{group_id} 本次¥{cost}, 今日累计¥{spent_today}/¥{self.daily_group_budget}, 剩余¥{remaining}")
         return cost, spent_today, remaining
+
+    def _record_spending_and_format(self, group_id: str, num_images: int, leading_newline: bool = False) -> Tuple[float, float, float, str]:
+        """记录预算并格式化提示；预算关闭时不返回 ¥0/inf 这种无意义文本。"""
+        cost, spent_today, remaining = self._record_spending(group_id, num_images)
+        if self.daily_group_budget <= 0 or num_images <= 0:
+            return cost, spent_today, remaining, ""
+        prefix = "\n" if leading_newline else ""
+        return (
+            cost,
+            spent_today,
+            remaining,
+            f"{prefix}💰 本次消耗 ¥{cost:.2f} | 今日已用 ¥{spent_today:.2f}/¥{self.daily_group_budget:.2f} | 剩余 ¥{remaining:.2f}"
+        )
     def _blocking_cleanup_temp_dir_logic(self, older_than_seconds: int) -> Tuple[int, int]:
         """
         同步执行临时目录清理的逻辑，移除旧文件。
@@ -389,6 +402,37 @@ class GeminiArtist(Star):
                 break
             except Exception as e:
                 logger.error(f"定时清理任务出错: {e}", exc_info=True)
+    def _pil_to_gemini_part(self, img: PILImage.Image) -> Any:
+        """Convert PIL image to an explicit Gemini inline image part.
+
+        Some Gemini-compatible proxies choke on the SDK's implicit PIL serialization
+        and report server-side base64 padding errors when an input image is present.
+        Sending a concrete JPEG byte part keeps the request format deterministic.
+        """
+        if img.mode in ("RGBA", "LA"):
+            bg = PILImage.new("RGB", img.size, (255, 255, 255))
+            alpha = img.getchannel("A") if img.mode == "RGBA" else img.getchannel(1)
+            bg.paste(img.convert("RGBA"), mask=alpha)
+            img_to_send = bg
+        elif img.mode != "RGB":
+            img_to_send = img.convert("RGB")
+        else:
+            img_to_send = img.copy()
+
+        max_side = 2048
+        if max(img_to_send.size) > max_side:
+            img_to_send.thumbnail((max_side, max_side), PILImage.Resampling.LANCZOS)
+
+        buf = BytesIO()
+        img_to_send.save(buf, format="JPEG", quality=95)
+        img_bytes = buf.getvalue()
+
+        if hasattr(genai.types.Part, "from_bytes"):
+            return genai.types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg")
+        return genai.types.Part(
+            inline_data=genai.types.Blob(mime_type="image/jpeg", data=img_bytes)
+        )
+
     @staticmethod
     def _safe_b64decode(data: Any) -> bytes:
         """Decode base64 data and tolerate missing padding from some gateways."""
@@ -938,8 +982,7 @@ class GeminiArtist(Star):
                         chain.append(Image.fromFileSystem(img_path))
 
                 if chain:
-                    cost, spent_today, remaining = self._record_spending(budget_group_id, len(image_paths))
-                    cost_info = f"💰本次消耗¥{cost:.2f} | 今日已用¥{spent_today:.2f}/¥{self.daily_group_budget:.2f} | 剩余¥{remaining:.2f}"
+                    cost, spent_today, remaining, cost_info = self._record_spending_and_format(budget_group_id, len(image_paths))
 
                     image_desc = text_response if text_response else "（API未返回文字描述，但图片已成功生成并发送）"
                     llm_feedback = "你已亲自生成并发送图片。你是作者；不要问用户怎么P的；不要再次调用任何画图工具。"
@@ -963,7 +1006,8 @@ class GeminiArtist(Star):
 
                     # 再发给用户
                     await event.send(event.chain_result(chain))
-                    await event.send(event.plain_result(cost_info))
+                    if cost_info:
+                        await event.send(event.plain_result(cost_info))
 
                     # 最稳“防失忆”：再调用一次当前聊天 LLM 发表观后感
                     await self._post_image_commentary_once(event, prompt, image_desc)
@@ -1002,8 +1046,7 @@ class GeminiArtist(Star):
                     ns.nodes.append(Node(user_id=bot_id_for_node, nickname=bot_name_for_node, content=[Image.fromFileSystem(img_path)]))
 
             if ns.nodes:
-                cost, spent_today, remaining = self._record_spending(budget_group_id, len(image_paths))
-                cost_info = f"💰本次消耗¥{cost:.2f} | 今日已用¥{spent_today:.2f}/¥{self.daily_group_budget:.2f} | 剩余¥{remaining:.2f}"
+                cost, spent_today, remaining, cost_info = self._record_spending_and_format(budget_group_id, len(image_paths))
 
                 image_desc = text_response if text_response else "（API未返回文字描述，但图片已成功生成并发送）"
                 tool_output_data = {
@@ -1019,7 +1062,8 @@ class GeminiArtist(Star):
                 yield json.dumps(tool_output_data, ensure_ascii=False)
 
                 await event.send(event.chain_result([ns]))
-                await event.send(event.plain_result(cost_info))
+                if cost_info:
+                    await event.send(event.plain_result(cost_info))
 
                 await self._post_image_commentary_once(event, prompt, image_desc)
             else:
@@ -1162,8 +1206,7 @@ class GeminiArtist(Star):
                 )
 
             # 记录花费
-            cost, spent_today, remaining = self._record_spending(budget_group_id, 1)
-            cost_info = f"💰本次消耗¥{cost:.2f} | 今日已用¥{spent_today:.2f}/¥{self.daily_group_budget:.2f} | 剩余¥{remaining:.2f}"
+            cost, spent_today, remaining, cost_info = self._record_spending_and_format(budget_group_id, 1)
             
             # 先告诉LLM结果（必须在发图之前）
             yield json.dumps({
@@ -1178,7 +1221,8 @@ class GeminiArtist(Star):
             # 然后发图片和预算提示给用户
             chain = [Image.fromFileSystem(image_path)]
             await event.send(event.chain_result(chain))
-            await event.send(event.plain_result(cost_info))
+            if cost_info:
+                await event.send(event.plain_result(cost_info))
             await self._post_image_commentary_once(event, scene_description, f"角色反应图场景：{scene_description}")
 
         except Exception as e:
@@ -1344,8 +1388,7 @@ class GeminiArtist(Star):
 
             chain = [Image.fromFileSystem(image_path)]
              # 记录花费
-            cost, spent_today, remaining = self._record_spending(budget_group_id, 1)
-            cost_info = f"💰本次消耗¥{cost:.2f} | 今日已用¥{spent_today:.2f}/¥{self.daily_group_budget:.2f} | 剩余¥{remaining:.2f}"
+            cost, spent_today, remaining, cost_info = self._record_spending_and_format(budget_group_id, 1)
             
             # 先告诉LLM
             yield json.dumps({
@@ -1359,7 +1402,8 @@ class GeminiArtist(Star):
             }, ensure_ascii=False)
             # 然后发图片
             await event.send(event.chain_result(chain))
-            await event.send(event.plain_result(cost_info))
+            if cost_info:
+                await event.send(event.plain_result(cost_info))
             await self._post_image_commentary_once(event, prompt, "多图合并结果已发送")
         except Exception as e:
             logger.error(f"combine_images_draw 错误: {e}", exc_info=True)
@@ -1566,12 +1610,14 @@ class GeminiArtist(Star):
                 logger.debug(f"collect_user_inputs (/draw): gemini_generate returned - Text: '{text_response[:50]}...', Images: {len(image_paths)}")
                 # ===== 记录花费 =====
                 if image_paths:
-                    draw_cost, draw_spent, draw_remaining = self._record_spending(budget_group_id, len(image_paths))
-                    cost_info_text = f"\n💰 本次消耗 ¥{draw_cost:.2f} | 今日已用 ¥{draw_spent:.2f}/¥{self.daily_group_budget:.2f} | 剩余 ¥{draw_remaining:.2f}"
-                    if text_response:
-                        text_response += cost_info_text
-                    else:
-                        text_response = cost_info_text.strip()
+                    draw_cost, draw_spent, draw_remaining, cost_info_text = self._record_spending_and_format(
+                        budget_group_id, len(image_paths), leading_newline=True
+                    )
+                    if cost_info_text:
+                        if text_response:
+                            text_response += cost_info_text
+                        else:
+                            text_response = cost_info_text.strip()
                 # 缓存机器人自己生成的图片 (对于 /draw 指令，图片的"owner"是触发指令的用户，但图片本身是机器人发的)
                 # 如果希望这些图片能被 LLM 工具通过 reference_bot=True 引用，则需要用 robot_id 缓存
                 if image_paths and self.robot_id_from_config:
@@ -1968,7 +2014,7 @@ class GeminiArtist(Star):
                     contents.append(text_prompt)
                     # +"。请使用中文回复,文字段与图片对应,除非特意要求，图片中不要有文字。"
                 for img_item in images_pil:
-                    contents.append(img_item)
+                    contents.append(self._pil_to_gemini_part(img_item))
                 if not contents:
                     raise ValueError("没有有效的内容发送给Gemini API")
 
