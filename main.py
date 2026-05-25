@@ -291,7 +291,7 @@ class GeminiArtist(Star):
                 if not b64:
                     raise ValueError("OpenAI 图片API未返回 b64_json")
 
-                img_bytes = base64.b64decode(b64)
+                img_bytes = self._safe_b64decode(b64)
                 os.makedirs(self.temp_dir, exist_ok=True)
                 out_fp = os.path.join(
                     self.temp_dir, f"openai_gen_{time.time()}_{random.randint(100,999)}.png"
@@ -389,6 +389,84 @@ class GeminiArtist(Star):
                 break
             except Exception as e:
                 logger.error(f"定时清理任务出错: {e}", exc_info=True)
+    @staticmethod
+    def _safe_b64decode(data: Any) -> bytes:
+        """Decode base64 data and tolerate missing padding from some gateways."""
+        if isinstance(data, bytes):
+            raw = data.strip()
+            raw += b"=" * (-len(raw) % 4)
+            return base64.b64decode(raw)
+        if isinstance(data, str):
+            raw = data.strip()
+            if "," in raw and raw.lower().startswith("data:"):
+                raw = raw.split(",", 1)[1]
+            raw += "=" * (-len(raw) % 4)
+            return base64.b64decode(raw)
+        return bytes(data)
+
+    def _is_likely_image_url(self, url: str) -> bool:
+        """Conservative filter for image URLs returned as text by some Gemini proxies."""
+        if not url:
+            return False
+        lower_url = url.lower()
+        if lower_url.startswith("data:image/"):
+            return True
+        if "/proxy/image" in lower_url or "image?url=" in lower_url:
+            return True
+        path_part = lower_url.split("?", 1)[0].split("#", 1)[0]
+        return path_part.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"))
+
+    def _extract_likely_image_urls(self, text: str) -> List[str]:
+        if not text:
+            return []
+        urls: List[str] = []
+        # Exclude markdown delimiters so malformed nested markdown like
+        # ![Generated Image](++[http://x](http://x))++ is split into valid URLs.
+        for match in re.findall(r"https?://[^\s\]\)\}\"'<>]+|data:image/[^\s\]\)\}\"'<>]+", text):
+            url = match.rstrip(".,;，。；：:")
+            if self._is_likely_image_url(url) and url not in urls:
+                urls.append(url)
+        return urls
+
+    def _remove_image_url_markup_from_text(self, text: str, urls: List[str]) -> str:
+        if not text or not urls:
+            return text or ""
+        cleaned = text
+        # Handle the common broken nested markdown wrapper from some Gemini-compatible gateways.
+        cleaned = re.sub(r"!\[[^\]]*\]\(\+\+\[[^\]]+\]\([^)]+\)\)\+\+", "", cleaned)
+        cleaned = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", cleaned)
+        for url in urls:
+            cleaned = cleaned.replace(url, "")
+        cleaned = re.sub(r"\+\+|\[\]\(\)|!\[Generated Image\]", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"[ \t]+", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        cleaned = cleaned.strip(" \n\t，,。.;；:：()（）[]【】")
+        return cleaned
+
+    async def _append_images_from_text_urls(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Download image URLs if an API returned images as markdown/text instead of inline image parts."""
+        text = (result.get("text", "") or "")
+        urls = self._extract_likely_image_urls(text)
+        if not urls:
+            return result
+
+        for idx, url in enumerate(urls, 1):
+            try:
+                pil_img = await self.download_pil_image_from_url(url, f"API文本中的图片链接 #{idx}")
+                if not pil_img:
+                    continue
+                os.makedirs(self.temp_dir, exist_ok=True)
+                fp = os.path.join(self.temp_dir, f"text_url_img_{time.time()}_{random.randint(100,999)}.png")
+                pil_img.save(fp, format="PNG")
+                result.setdefault("image_paths", []).append(fp)
+                logger.info(f"已从API文本图片链接下载并保存图片: {fp}")
+            except Exception as e:
+                logger.warning(f"处理API文本图片链接失败: {url}, 错误: {e}", exc_info=True)
+
+        if result.get("image_paths"):
+            result["text"] = self._remove_image_url_markup_from_text(text, urls)
+        return result
+
     def store_user_image(self, user_id: str, group_id: str, image_url: str, original_filename: Optional[str] = None) -> None:
         """
         将用户发送的图片URL存储到缓存中。
@@ -420,7 +498,7 @@ class GeminiArtist(Star):
         if image_url.startswith("data:image"):
             try:
                 header, encoded = image_url.split(",", 1)
-                image_bytes = base64.b64decode(encoded)
+                image_bytes = self._safe_b64decode(encoded)
                 img_pil = PILImage.open(BytesIO(image_bytes))
                 img_pil.load()
                 return img_pil.convert("RGBA") if img_pil.mode != "RGBA" else img_pil
@@ -637,7 +715,7 @@ class GeminiArtist(Star):
             logger.info(f"从缓存加载Base64 Data URL (用户 {user_id}, 上下文 {group_id}, 索引 {index})")
             try:
                 header, encoded = image_ref_str.split(",", 1)
-                image_bytes = base64.b64decode(encoded)
+                image_bytes = self._safe_b64decode(encoded)
                 pil_image = PILImage.open(BytesIO(image_bytes))
                 return pil_image.convert('RGBA') if pil_image.mode != 'RGBA' else pil_image
             except Exception as e:
@@ -1723,7 +1801,7 @@ class GeminiArtist(Star):
                         # 处理 base64 数据
                         if image_data:
                             try:
-                                img_bytes = base64.b64decode(image_data)
+                                img_bytes = self._safe_b64decode(image_data)
                                 img_pil = PILImage.open(BytesIO(img_bytes))
                                 
                                 os.makedirs(self.temp_dir, exist_ok=True)
@@ -1927,6 +2005,10 @@ class GeminiArtist(Star):
                         result['text'] += part.text
                     elif hasattr(part, 'inline_data') and part.inline_data and hasattr(part.inline_data, 'mime_type') and part.inline_data.mime_type.startswith('image/'):
                         img_data = part.inline_data.data
+                        if isinstance(img_data, str):
+                            img_data = self._safe_b64decode(img_data)
+                        elif not isinstance(img_data, (bytes, bytearray)):
+                            img_data = bytes(img_data)
                         gen_img = PILImage.open(BytesIO(img_data))
                         ext = part.inline_data.mime_type.split('/')[-1]
                         if ext not in ['png', 'jpeg', 'jpg', 'webp', 'gif']:
@@ -1939,6 +2021,7 @@ class GeminiArtist(Star):
 
                 if not result['text'] and not result['image_paths']:
                     logger.warning(f"Gemini API返回空文本和图片. Candidate: {candidate}")
+                result = await self._append_images_from_text_urls(result)
                 if not self.random_api_key_selection:
                     self.current_api_key_index = (key_idx_to_use + 1) % len(self.api_keys)
                 return result
