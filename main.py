@@ -176,13 +176,30 @@ class GeminiArtist(Star):
             logger.info(f"临时目录清理: 移除 {cleaned_count} 文件, 发生 {error_count} 错误 @ {self.temp_dir}")
         return cleaned_count, error_count
     def _normalize_openai_base_url(self, base_url: str) -> str:
-        """把用户填的 api_base_url 归一化成 .../v1 结尾，兼容中转站。"""
+        """把用户填的 api_base_url 归一化成 OpenAI SDK 可用的 .../v1。
+
+        兼容用户直接填 Flow2API 示例里的完整地址：
+        http://host:8000/v1/chat/completions -> http://host:8000/v1
+        """
         url = (base_url or "").strip().rstrip("/")
         if not url:
             return "https://api.openai.com/v1"
-        if not url.endswith("/v1"):
+        lower = url.lower()
+        if lower.endswith("/chat/completions"):
+            url = url[: -len("/chat/completions")].rstrip("/")
+            lower = url.lower()
+        if not lower.endswith("/v1"):
             url = url + "/v1"
         return url
+
+    @staticmethod
+    def _looks_like_flow2api_upload_error(exc: Exception) -> bool:
+        msg = str(exc or "")
+        return (
+            "/flow/uploadImage" in msg
+            or "uploadUserImage fallback is disabled" in msg
+            or "Project-scoped image upload failed" in msg
+        )
 
     async def openai_image_generate(
         self,
@@ -383,7 +400,19 @@ class GeminiArtist(Star):
         elif self.api_type == "OpenAI":
             return await self.openai_image_generate(text_prompt, images_pil, aspect_ratio)
         else:
-            return await self.gemini_generate(text_prompt, images_pil)
+            try:
+                return await self.gemini_generate(text_prompt, images_pil)
+            except Exception as e:
+                # Flow2API 的 Gemini 兼容端在带图时可能走 /flow/uploadImage 并因 project_id 报 500。
+                # 参考 gitee_aiimg 的做法：这类服务应走 OpenAI Chat Completions 多模态格式
+                # （data:image），不要走 google-genai SDK 的 Gemini 原生上传流程。
+                if images_pil and self._looks_like_flow2api_upload_error(e):
+                    logger.warning(
+                        "检测到 Flow2API 项目级图片上传失败，自动改用 OpenAI Chat Completions 格式重试一次。",
+                        exc_info=True,
+                    )
+                    return await self.openrouter_generate(text_prompt, images_pil)
+                raise
 
     async def _periodic_temp_dir_cleanup(self):
         """
@@ -1908,8 +1937,8 @@ class GeminiArtist(Star):
                 logger.info(f"openrouter_generate: 尝试密钥索引 {key_idx}")
                 
                 # 1. 使用 AsyncOpenAI (异步客户端)
-                # 这里的 base_url 必须带 /v1
-                base_url = self.api_base_url_from_config
+                # OpenAI SDK 的 base_url 必须是 .../v1，不能带 /chat/completions。
+                base_url = self._normalize_openai_base_url(self.api_base_url_from_config)
                 
                 client = AsyncOpenAI(
                     api_key=api_key, 
@@ -1921,11 +1950,16 @@ class GeminiArtist(Star):
                 content = [{"type": "text", "text": text_prompt}]
                 for img in images_pil:
                     try:
-                        buf = BytesIO()
-                        img.save(buf, format="PNG")
-                        b64 = base64.b64encode(buf.getvalue()).decode()
-                        content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
-                    except: pass
+                        part = self._pil_to_gemini_part(img)
+                        img_bytes = getattr(getattr(part, "inline_data", None), "data", None)
+                        if not img_bytes:
+                            buf = BytesIO()
+                            img.convert("RGB").save(buf, format="JPEG", quality=95)
+                            img_bytes = buf.getvalue()
+                        b64 = base64.b64encode(img_bytes).decode()
+                        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+                    except Exception as e_img:
+                        logger.warning(f"openrouter_generate: 跳过一张输入图，转换失败: {e_img}")
 
                 result = {'text': '', 'image_paths': []}
                 
@@ -1960,7 +1994,11 @@ class GeminiArtist(Star):
                     result['text'] = full_content
                     logger.warning(f"DEBUG - 完整响应内容: {full_content}")
 
-                # 5. 提取链接
+                # 5. 提取链接 / data:image。先走统一解析，兼容 Flow2API 的 markdown、JSON字段和 proxy/image。
+                result = await self._append_images_from_text_urls(result)
+                if result['image_paths']:
+                    return result
+
                 import re
                 urls = re.findall(r'(https?://[^\s\)"\'<>\]]+)', full_content)
                 for url in urls:
