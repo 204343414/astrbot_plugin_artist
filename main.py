@@ -1,6 +1,6 @@
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+from astrbot.api import logger, sp
 from astrbot.api.all import *
 from astrbot.api.message_components import Node, Plain, Image, Nodes, Reply, BaseMessageComponent
 import asyncio
@@ -21,6 +21,9 @@ import json
 from pathlib import Path
 import re
 
+
+class PromptSafetyBlockedError(Exception):
+    """前置审核拒绝生图请求。"""
 
 
 @register("gemini_artist_plugin", "nichinichisou", "基于 Google Gemini 和 OpenRouter 格式 API 的AI绘画插件", "1.5.0")
@@ -97,11 +100,347 @@ class GeminiArtist(Star):
         self.cost_per_image = float(config.get("cost_per_image", 0.2))
         # {group_id_str: {'date': 'YYYY-MM-DD', 'spent': float}}
         self.group_spending: Dict[str, Dict[str, Any]] = {}
+
+        # ===== 生图前提示词审核 / 蜜罐 =====
+        self.enable_prompt_review = bool(config.get("enable_prompt_review", True))
+        self.prompt_review_model = str(config.get("prompt_review_model", "omni-moderation-latest") or "omni-moderation-latest").strip()
+        self.prompt_review_fallback_to_llm = bool(config.get("prompt_review_fallback_to_llm", True))
+        self.prompt_review_block_message = str(
+            config.get("prompt_review_block_message", "这个提示词不接，换个正常点的。")
+            or "这个提示词不接，换个正常点的。"
+        ).strip()
+        self.prompt_review_honeypot_reply = str(
+            config.get("prompt_review_honeypot_reply", "你咋不把你爹妈照片发来我帮你画😅")
+            or "你咋不把你爹妈照片发来我帮你画😅"
+        ).strip()
+        self.prompt_review_auto_delete = bool(config.get("prompt_review_auto_delete", False))
+        self.prompt_review_auto_blacklist = bool(config.get("prompt_review_auto_blacklist", True))
+        self.prompt_review_use_honeypot_reply = bool(config.get("prompt_review_use_honeypot_reply", False))
+        self.prompt_review_hard_categories = [
+            str(x).strip()
+            for x in config.get(
+                "prompt_review_hard_categories",
+                [
+                    "sexual/minors",
+                    "self-harm/instructions",
+                    "illicit/violent",
+                    "hate/threatening",
+                    "harassment/threatening",
+                    "violence/graphic",
+                ],
+            )
+            if str(x).strip()
+        ]
+        self.prompt_review_hard_keywords = [
+            str(x).strip().lower()
+            for x in config.get("prompt_review_hard_keywords", [])
+            if str(x).strip()
+        ]
+        self.block_political_content = bool(config.get("block_political_content", True))
+        self.political_block_message = str(
+            config.get(
+                "political_block_message",
+                "涉及现实政治人物、政治宣传、政治讽刺或政治丑化的绘图请求不处理，请换个非政治题材。",
+            )
+            or "涉及现实政治人物、政治宣传、政治讽刺或政治丑化的绘图请求不处理，请换个非政治题材。"
+        ).strip()
+        self.political_hard_keywords = [
+            str(x).strip().lower()
+            for x in config.get(
+                "political_hard_keywords",
+                [
+                    "习近平", "毛泽东", "邓小平", "江泽民", "胡锦涛", "李克强", "温家宝", "彭丽媛",
+                    "特朗普", "拜登", "普京", "泽连斯基", "金正恩", "蔡英文", "赖清德", "马英九",
+                    "陈水扁", "安倍", "岸田", "尹锡悦",
+                    "国家主席", "总书记", "总理", "总统", "议员", "首相", "官员", "领导人", "政治人物",
+                    "中共中央", "政治局", "国务院", "人大", "政协", "中南海", "共产党", "党代会", "两会",
+                    "天安门", "六四", "文革", "港独", "台独", "疆独", "藏独", "选举", "政治海报", "政治宣传",
+                    "丑化领导人", "讽刺领导人",
+                ],
+            )
+            if str(x).strip()
+        ]
+        self.local_blacklist_enabled = bool(config.get("local_blacklist_enabled", True))
+        self.local_blacklist_store_key = "gemini_artist_local_blacklist"
+        self.local_blacklist: Dict[str, Dict[str, Any]] = sp.get(self.local_blacklist_store_key, {}) or {}
+
         if self.cleanup_interval_seconds > 0:
             self._background_cleanup_task = asyncio.create_task(self._periodic_temp_dir_cleanup())
             logger.info(f"GeminiArtist: 已启动定时清理任务，每隔 {self.cleanup_interval_seconds} 秒清理临时目录 {self.temp_dir} 中超过 {self.cleanup_older_than_seconds} 秒的文件。")
         else:
             logger.info("GeminiArtist: 定时清理功能已禁用 (temp_cleanup_interval_seconds <= 0)。")
+
+    def _persist_local_blacklist(self) -> None:
+        try:
+            sp.put(self.local_blacklist_store_key, self.local_blacklist)
+        except Exception as e:
+            logger.error(f"保存本地黑名单失败: {e}", exc_info=True)
+
+    def _is_locally_blacklisted(self, user_id: str) -> bool:
+        if not self.local_blacklist_enabled:
+            return False
+        return str(user_id) in self.local_blacklist
+
+    def _blacklist_user(self, user_id: str, reason: str, group_id: str = "") -> None:
+        uid = str(user_id)
+        self.local_blacklist[uid] = {
+            "reason": str(reason or "命中生图审核拦截"),
+            "group_id": str(group_id or ""),
+            "timestamp": time.time(),
+        }
+        self._persist_local_blacklist()
+        logger.warning(f"已将用户 {uid} 加入插件本地黑名单，原因: {reason}")
+
+    @staticmethod
+    def _to_plain_dict(obj: Any) -> Dict[str, Any]:
+        if obj is None:
+            return {}
+        if isinstance(obj, dict):
+            return obj
+        if hasattr(obj, "model_dump"):
+            try:
+                return obj.model_dump()
+            except Exception:
+                pass
+        if hasattr(obj, "dict"):
+            try:
+                return obj.dict()
+            except Exception:
+                pass
+        data = {}
+        for key in dir(obj):
+            if key.startswith("_"):
+                continue
+            try:
+                value = getattr(obj, key)
+            except Exception:
+                continue
+            if callable(value):
+                continue
+            data[key] = value
+        return data
+
+    def _pil_to_data_url(self, img: PILImage.Image) -> str:
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+        return f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
+
+    def _review_prompt_via_local_rules(self, prompt_text: str) -> Dict[str, Any]:
+        lowered_prompt = (prompt_text or "").lower()
+
+        if self.block_political_content:
+            political_hit = next((kw for kw in self.political_hard_keywords if kw and kw in lowered_prompt), "")
+            if political_hit:
+                return {
+                    "allowed": False,
+                    "hard_block": True,
+                    "source": "local_rules",
+                    "reason": f"命中政治内容关键词: {political_hit}",
+                    "matched_categories": ["politics"],
+                    "reply": self.political_block_message,
+                    "blacklist_user": False,
+                    "delete_message": False,
+                }
+
+        keyword_hit = next((kw for kw in self.prompt_review_hard_keywords if kw and kw in lowered_prompt), "")
+        if keyword_hit:
+            return {
+                "allowed": False,
+                "hard_block": True,
+                "source": "local_rules",
+                "reason": f"命中高危关键词: {keyword_hit}",
+                "matched_categories": ["keyword_hard_block"],
+            }
+
+        return {"allowed": True, "source": "local_rules"}
+
+    async def _review_prompt_via_openai_moderation(
+        self,
+        prompt_text: str,
+        images_pil: Optional[List[PILImage.Image]] = None,
+    ) -> Dict[str, Any]:
+        if not self.api_keys:
+            raise ValueError("没有可用于审核的 API Key")
+
+        base_url = self._normalize_openai_base_url(self.api_base_url_from_config)
+        key_idx = random.randrange(len(self.api_keys)) if self.random_api_key_selection else self.current_api_key_index % len(self.api_keys)
+        client = OpenAI(api_key=self.api_keys[key_idx], base_url=base_url)
+
+        review_input: List[Dict[str, Any]] = [{"type": "text", "text": prompt_text[:8000]}]
+        for img in (images_pil or [])[:1]:
+            try:
+                review_input.append({"type": "image_url", "image_url": {"url": self._pil_to_data_url(img)}})
+            except Exception as e:
+                logger.warning(f"提示词审核：附带图片转 data URL 失败，已跳过: {e}")
+
+        def _call_moderation():
+            return client.moderations.create(
+                model=self.prompt_review_model,
+                input=review_input,
+            )
+
+        rsp = await asyncio.to_thread(_call_moderation)
+        results = getattr(rsp, "results", None) or []
+        if not results:
+            raise ValueError("审核接口未返回 results")
+
+        result0 = results[0]
+        flagged = bool(getattr(result0, "flagged", False))
+        categories = self._to_plain_dict(getattr(result0, "categories", None))
+        category_scores = self._to_plain_dict(getattr(result0, "category_scores", None))
+        matched_categories = [k for k, v in categories.items() if bool(v)]
+        matched_hard = [c for c in matched_categories if c in set(self.prompt_review_hard_categories)]
+
+        lowered_prompt = (prompt_text or "").lower()
+        keyword_hit = next((kw for kw in self.prompt_review_hard_keywords if kw and kw in lowered_prompt), "")
+
+        allowed = (not flagged) and (not keyword_hit)
+        hard_block = bool(matched_hard or keyword_hit)
+        reason_parts = []
+        if matched_categories:
+            reason_parts.append("命中分类: " + ", ".join(matched_categories))
+        if keyword_hit:
+            reason_parts.append(f"命中关键词: {keyword_hit}")
+
+        return {
+            "allowed": allowed,
+            "hard_block": hard_block,
+            "source": "openai_moderation",
+            "flagged": flagged,
+            "matched_categories": matched_categories,
+            "category_scores": category_scores,
+            "reason": "；".join(reason_parts) if reason_parts else ("审核通过" if allowed else "命中审核规则"),
+        }
+
+    async def _review_prompt_via_llm(
+        self,
+        event: AstrMessageEvent,
+        prompt_text: str,
+        images_pil: Optional[List[PILImage.Image]] = None,
+    ) -> Dict[str, Any]:
+        provider = self.context.get_using_provider(umo=event.unified_msg_origin)
+        if not provider:
+            raise ValueError("当前会话没有可用文本 LLM，无法做审核兜底")
+
+        review_prompt = (
+            "你是画图请求审核器。请判断下面的生图请求是否应该被拦截。\n"
+            "重点拦截：未成年人色情/擦边、真人私密照或深度伪造羞辱、明显血腥暴力、鼓励自残、违法伤害、仇恨骚扰、会导致机器人号高风险封禁的内容。\n"
+            "如果只是正常二次元、普通写实、轻微情绪表达，不要误杀。\n"
+            "只输出严格 JSON，不要解释，不要 markdown。格式："
+            '{"allow":true,"severity":"safe|soft|hard","reason":"...","matched_tags":["..."]}'
+            f"\n\n待审核提示词：{prompt_text}"
+        )
+
+        image_urls: List[str] = []
+        for img in (images_pil or [])[:1]:
+            try:
+                image_urls.append(self._pil_to_data_url(img))
+            except Exception:
+                pass
+
+        llm_resp = await provider.text_chat(prompt=review_prompt, image_urls=image_urls)
+        raw = (getattr(llm_resp, "completion_text", "") or "").strip()
+        if not raw:
+            raise ValueError("LLM 审核返回空内容")
+
+        match = re.search(r"\{.*\}", raw, flags=re.S)
+        payload = json.loads(match.group(0) if match else raw)
+        severity = str(payload.get("severity", "safe") or "safe").lower()
+        allowed = bool(payload.get("allow", severity == "safe"))
+        return {
+            "allowed": allowed,
+            "hard_block": severity == "hard",
+            "source": "llm_fallback",
+            "reason": str(payload.get("reason", "LLM 审核拦截") or "LLM 审核拦截"),
+            "matched_categories": payload.get("matched_tags", []) or [],
+            "raw": raw,
+        }
+
+    async def _review_prompt_before_generation(
+        self,
+        event: AstrMessageEvent,
+        prompt_text: str,
+        images_pil: Optional[List[PILImage.Image]] = None,
+    ) -> Dict[str, Any]:
+        if not self.enable_prompt_review:
+            return {"allowed": True, "source": "disabled"}
+
+        sender_id = str(event.get_sender_id())
+        if self._is_locally_blacklisted(sender_id):
+            info = self.local_blacklist.get(sender_id, {}) or {}
+            return {
+                "allowed": False,
+                "hard_block": True,
+                "source": "local_blacklist",
+                "reason": str(info.get("reason", "已在本地黑名单中")),
+                "reply": "你已经被拉黑，别试了。",
+                "blacklist_user": False,
+                "delete_message": False,
+            }
+
+        local_rule_result = self._review_prompt_via_local_rules(prompt_text)
+        if not local_rule_result.get("allowed", True):
+            return local_rule_result
+
+        review_result: Optional[Dict[str, Any]] = None
+
+        if self.api_type in ("OpenAI", "OpenRouter"):
+            try:
+                review_result = await self._review_prompt_via_openai_moderation(prompt_text, images_pil)
+            except Exception as e:
+                logger.warning(f"OpenAI Moderation 审核失败，准备走兜底审核: {e}", exc_info=True)
+
+        if review_result is None and self.prompt_review_fallback_to_llm:
+            try:
+                review_result = await self._review_prompt_via_llm(event, prompt_text, images_pil)
+            except Exception as e:
+                logger.warning(f"LLM 兜底审核失败，默认放行: {e}", exc_info=True)
+
+        if review_result is None:
+            return {"allowed": True, "source": "review_unavailable"}
+
+        if review_result.get("allowed", True):
+            return review_result
+
+        hard_block = bool(review_result.get("hard_block"))
+        review_result["reply"] = (
+            self.prompt_review_honeypot_reply
+            if hard_block and self.prompt_review_use_honeypot_reply
+            else self.prompt_review_block_message
+        )
+        review_result["blacklist_user"] = hard_block and self.prompt_review_auto_blacklist
+        review_result["delete_message"] = hard_block and self.prompt_review_auto_delete
+        return review_result
+
+    async def _try_delete_source_message(self, event: AstrMessageEvent) -> bool:
+        try:
+            message_id = getattr(event.message_obj, "message_id", None)
+            client = getattr(event, "bot", None)
+            if not message_id or not client or not hasattr(client, "api"):
+                return False
+            await client.api.call_action("delete_msg", message_id=message_id)
+            logger.info(f"已尝试撤回/删除触发消息: {message_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"删除触发消息失败（可能是平台不支持）: {e}", exc_info=True)
+            return False
+
+    async def _handle_blocked_prompt(self, event: AstrMessageEvent, review_result: Dict[str, Any]) -> str:
+        reason = str(review_result.get("reason", "命中审核规则"))
+        group_id = getattr(event.message_obj, "group_id", "") if hasattr(event, "message_obj") else ""
+
+        if review_result.get("delete_message"):
+            await self._try_delete_source_message(event)
+        if review_result.get("blacklist_user"):
+            self._blacklist_user(event.get_sender_id(), reason, str(group_id or ""))
+
+        logger.warning(
+            f"生图前审核拦截: user={event.get_sender_id()} source={review_result.get('source')} reason={reason}"
+        )
+        return str(review_result.get("reply") or self.prompt_review_block_message)
+
     def _get_today_str(self) -> str:
         """获取今天的日期字符串，用于预算重置判断。"""
         from datetime import date
@@ -337,6 +676,13 @@ class GeminiArtist(Star):
                 return result
 
             except Exception as e:
+                err_code = getattr(e, "code", None)
+                if err_code in ("moderation_blocked", "content_policy_violation"):
+                    moderation_details = getattr(e, "moderation_details", None)
+                    logger.warning(
+                        f"openai_image_generate: 请求被模型侧安全策略拦截: {moderation_details or e}"
+                    )
+                    raise PromptSafetyBlockedError(str(moderation_details or e))
                 last_exception = e
                 logger.error(
                     f"openai_image_generate: API处理失败 (密钥 {key_idx_to_use}): {e}",
@@ -810,6 +1156,17 @@ class GeminiArtist(Star):
             return None
 
     @filter.event_message_type(EventMessageType.ALL)
+    async def filter_locally_blacklisted_users(self, event: AstrMessageEvent):
+        """本地黑名单：命中后直接停止事件传播。"""
+        if not self.local_blacklist_enabled:
+            return
+        user_id = event.get_sender_id()
+        if self._is_locally_blacklisted(user_id):
+            logger.info(f"本地黑名单拦截用户消息: {user_id}")
+            event.stop_event()
+            return
+
+    @filter.event_message_type(EventMessageType.ALL)
     async def cache_user_images(self, event: AstrMessageEvent):
         """
         监听所有消息，将用户发送的图片URL缓存起来。
@@ -969,6 +1326,13 @@ class GeminiArtist(Star):
         if aspect_ratio and aspect_ratio != "auto":
             all_text = all_text + f" Image aspect ratio: {aspect_ratio}."
 
+        review_result = await self._review_prompt_before_generation(event, all_text, all_images_pil)
+        if not review_result.get("allowed", True):
+            blocked_reply = await self._handle_blocked_prompt(event, review_result)
+            yield event.plain_result(blocked_reply)
+            event.stop_event()
+            return
+
         if self.enable_hinting:
             await event.send(event.plain_result("🎨#(#!&...✍!"))
 
@@ -1098,6 +1462,9 @@ class GeminiArtist(Star):
             else:
                 yield event.plain_result("抱歉，未能生成有效内容。")
 
+        except PromptSafetyBlockedError as e:
+            logger.warning(f"gemini_draw: 模型侧安全拦截: {e}")
+            yield event.plain_result(self.prompt_review_block_message)
         except Exception as e:
             logger.error(f"gemini_draw 未知错误: {e}", exc_info=True)
             yield event.plain_result(f"处理请求时发生意外错误: {str(e)}")
@@ -1195,6 +1562,12 @@ class GeminiArtist(Star):
 
         final_prompt = self._build_reaction_prompt(scene_description, has_reference_meme)
 
+        review_result = await self._review_prompt_before_generation(event, final_prompt, images_for_api)
+        if not review_result.get("allowed", True):
+            blocked_reply = await self._handle_blocked_prompt(event, review_result)
+            yield json.dumps({"success": False, "message": blocked_reply}, ensure_ascii=False)
+            return
+
         try:
             logger.info(f"generate_self_reaction: 开始生成，场景: {scene_description[:50]}...")
             
@@ -1254,6 +1627,9 @@ class GeminiArtist(Star):
                 await event.send(event.plain_result(cost_info))
             await self._post_image_commentary_once(event, scene_description, f"角色反应图场景：{scene_description}")
 
+        except PromptSafetyBlockedError as e:
+            logger.warning(f"generate_self_reaction: 模型侧安全拦截: {e}")
+            yield json.dumps({"success": False, "message": self.prompt_review_block_message}, ensure_ascii=False)
         except Exception as e:
             logger.error(f"generate_self_reaction 错误: {e}", exc_info=True)
             yield json.dumps({"success": False, "message": "生成过程出错，请用文字回应"}, ensure_ascii=False)    
@@ -1397,6 +1773,12 @@ class GeminiArtist(Star):
         if use_character_ref:
             final_prompt = f"参考图1是角色形象参考。" + final_prompt
 
+        review_result = await self._review_prompt_before_generation(event, final_prompt, images_for_api)
+        if not review_result.get("allowed", True):
+            blocked_reply = await self._handle_blocked_prompt(event, review_result)
+            yield json.dumps({"success": False, "message": blocked_reply}, ensure_ascii=False)
+            return
+
         try:
             result = await self._generate_by_api_type(final_prompt, images_for_api, "1:1")
 
@@ -1434,6 +1816,9 @@ class GeminiArtist(Star):
             if cost_info:
                 await event.send(event.plain_result(cost_info))
             await self._post_image_commentary_once(event, prompt, "多图合并结果已发送")
+        except PromptSafetyBlockedError as e:
+            logger.warning(f"combine_images_draw: 模型侧安全拦截: {e}")
+            yield json.dumps({"success": False, "message": self.prompt_review_block_message}, ensure_ascii=False)
         except Exception as e:
             logger.error(f"combine_images_draw 错误: {e}", exc_info=True)
             yield json.dumps({"success": False, "message": "合并过程出错"}, ensure_ascii=False)    
@@ -1622,6 +2007,13 @@ class GeminiArtist(Star):
                     f"⚠️ 今日该群画图额度已用完（已消耗 ¥{budget_spent:.2f}/¥{self.daily_group_budget:.2f}），明天零点重置哦~"
                 )
                 return
+
+            review_result = await self._review_prompt_before_generation(event, final_prompt_text, all_pil_images_for_api)
+            if not review_result.get("allowed", True):
+                blocked_reply = await self._handle_blocked_prompt(event, review_result)
+                yield event.plain_result(blocked_reply)
+                return
+
             yield event.plain_result("收到开始指令，正在为您生成图片，请稍候...")
             
             try:
@@ -1719,6 +2111,10 @@ class GeminiArtist(Star):
                         yield event.plain_result("抱歉，未能生成有效内容进行合并转发。")
                 return
 
+            except PromptSafetyBlockedError as e_gen:
+                logger.warning(f"collect_user_inputs (/draw): 模型侧安全拦截: {str(e_gen)}")
+                yield event.plain_result(self.prompt_review_block_message)
+                return
             except Exception as e_gen:
                 logger.error(f"collect_user_inputs (/draw): 在 /draw 会话的生成或回复阶段发生错误: {str(e_gen)}", exc_info=True)
                 yield event.plain_result(f"处理您的 /draw 请求时发生错误: {str(e_gen)}")
@@ -2020,6 +2416,10 @@ class GeminiArtist(Star):
                 logger.warning("本次尝试未获取到图片，尝试下一个Key...")
 
             except Exception as e:
+                err_code = getattr(e, "code", None)
+                if err_code in ("moderation_blocked", "content_policy_violation"):
+                    logger.warning(f"openrouter_generate: 请求被模型侧安全策略拦截: {e}")
+                    raise PromptSafetyBlockedError(str(e))
                 logger.error(f"密钥 {key_idx} 失败: {e}", exc_info=True)
                 last_exception = e
         
