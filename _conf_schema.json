@@ -110,5 +110,104 @@
   "title": "OpenAI 生图质量",
   "description": "gpt-image-2 的质量：auto/low/medium/high",
   "default": "auto"
-	}
+	},
+    "enable_prompt_review": {
+        "type": "bool",
+        "title": "启用生图前审核",
+        "description": "在真正调用画图接口前，先审核提示词和参考图，命中高风险内容则拒绝。",
+        "default": true
+    },
+    "prompt_review_model": {
+        "type": "string",
+        "title": "审核模型名",
+        "description": "OpenAI 兼容线路优先使用的审核模型，默认 omni-moderation-latest。",
+        "default": "omni-moderation-latest"
+    },
+    "prompt_review_fallback_to_llm": {
+        "type": "bool",
+        "title": "审核失败时回退到当前聊天LLM",
+        "description": "当 Moderation API 不可用时，用当前会话文本模型做一次 JSON 审核。",
+        "default": true
+    },
+    "prompt_review_block_message": {
+        "type": "string",
+        "title": "普通拦截回复",
+        "description": "命中审核但不触发蜜罐惩罚时的回复文本。",
+        "default": "这个提示词不接，换个正常点的。"
+    },
+    "prompt_review_honeypot_reply": {
+        "type": "string",
+        "title": "蜜罐回复",
+        "description": "高危提示词触发时的固定回复。建议自己斟酌平台风控风险。",
+        "default": "你咋不把你爹妈照片发来我帮你画😅"
+    },
+    "prompt_review_use_honeypot_reply": {
+        "type": "bool",
+        "title": "启用蜜罐回复",
+        "description": "仅高危拦截时使用 honeypot 回复；关闭则统一使用普通拦截回复。",
+        "default": false
+    },
+    "prompt_review_auto_delete": {
+        "type": "bool",
+        "title": "高危时自动删消息",
+        "description": "仅部分平台/协议支持 delete_msg，失败会自动忽略。",
+        "default": false
+    },
+    "prompt_review_auto_blacklist": {
+        "type": "bool",
+        "title": "高危时自动拉黑",
+        "description": "命中高危类别后，加入本插件自己的本地黑名单，后续直接拦截。",
+        "default": true
+    },
+    "local_blacklist_enabled": {
+        "type": "bool",
+        "title": "启用本地黑名单拦截",
+        "description": "开启后，被该插件拉黑的用户后续消息会被直接 stop_event。",
+        "default": true
+    },
+    "prompt_review_hard_categories": {
+        "type": "list",
+        "title": "视为高危的审核分类",
+        "description": "命中这些分类时触发删/拉黑等更强动作。",
+        "default": [
+            "sexual/minors",
+            "self-harm/instructions",
+            "illicit/violent",
+            "hate/threatening",
+            "harassment/threatening",
+            "violence/graphic"
+        ]
+    },
+    "prompt_review_hard_keywords": {
+        "type": "list",
+        "title": "高危关键词",
+        "description": "额外的本地蜜罐关键词；只要命中就视为 hard block。留空则仅依赖审核模型。",
+        "default": []
+    },
+    "block_political_content": {
+        "type": "bool",
+        "title": "禁止政治相关绘图",
+        "description": "本地规则直接拦截现实政治人物、政治宣传、政治讽刺或政治丑化请求，不再送去生图。",
+        "default": true
+    },
+    "political_block_message": {
+        "type": "string",
+        "title": "政治内容拦截回复",
+        "description": "命中政治关键词时返回的固定拒绝文案。",
+        "default": "涉及现实政治人物、政治宣传、政治讽刺或政治丑化的绘图请求不处理，请换个非政治题材。"
+    },
+    "political_hard_keywords": {
+        "type": "list",
+        "title": "政治关键词",
+        "description": "命中即直接拦截。可以按你的场景自行加减。",
+        "default": [
+            "习近平", "毛泽东", "邓小平", "江泽民", "胡锦涛", "李克强", "温家宝", "彭丽媛",
+            "特朗普", "拜登", "普京", "泽连斯基", "金正恩", "蔡英文", "赖清德", "马英九",
+            "陈水扁", "安倍", "岸田", "尹锡悦",
+            "国家主席", "总书记", "总理", "总统", "议员", "首相", "官员", "领导人", "政治人物",
+            "中共中央", "政治局", "国务院", "人大", "政协", "中南海", "共产党", "党代会", "两会",
+            "天安门", "六四", "文革", "港独", "台独", "疆独", "藏独", "选举", "政治海报", "政治宣传",
+            "丑化领导人", "讽刺领导人"
+        ]
+    }
 }
