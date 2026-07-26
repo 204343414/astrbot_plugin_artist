@@ -27,7 +27,7 @@ class PromptSafetyBlockedError(Exception):
     """前置审核拒绝生图请求。"""
 
 
-@register("gemini_artist_plugin", "nichinichisou", "无会话 LLM 的一次性 OpenID 配额画图插件", "2.0.0")
+@register("gemini_artist_plugin", "nichinichisou", "无会话 LLM 的一次性 OpenID 配额画图插件", "2.1.0")
 class GeminiArtist(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -139,6 +139,15 @@ class GeminiArtist(Star):
             )
             if str(x).strip()
         ]
+        self.enable_reference_safety_review = bool(
+            config.get("enable_reference_safety_review", True)
+        )
+        self.reference_safety_provider_id = str(
+            config.get("reference_safety_provider_id", "") or ""
+        ).strip()
+        self.reference_safety_fail_closed = bool(
+            config.get("reference_safety_fail_closed", True)
+        )
         self.prompt_review_hard_keywords = [
             str(x).strip().lower()
             for x in config.get("prompt_review_hard_keywords", [])
@@ -365,6 +374,66 @@ class GeminiArtist(Star):
             "matched_categories": payload.get("matched_tags", []) or [],
             "raw": raw,
         }
+
+    async def _review_reference_images_safety(
+        self,
+        images_pil: Optional[List[PILImage.Image]] = None,
+    ) -> Dict[str, Any]:
+        """One independent vision review; never enters the chat conversation."""
+        images = list(images_pil or [])
+        if not images or not self.enable_reference_safety_review:
+            return {"allowed": True, "source": "reference_review_not_needed"}
+        if not self.reference_safety_provider_id:
+            if self.reference_safety_fail_closed:
+                return {
+                    "allowed": False,
+                    "reason": "管理员尚未配置参考图安全识别模型",
+                }
+            return {"allowed": True, "source": "reference_review_unconfigured"}
+
+        image_urls = [self._pil_to_data_url(image) for image in images[:3]]
+        prompt = (
+            "你是绘图参考图安全审核器。识别图片是否包含现实中的公众人物或政治人物。"
+            "不要根据种族、国籍或普通人的长相猜身份；只有高度确信是知名现实人物时才填写姓名。"
+            "现实政治人物、政治宣传素材、政治讽刺或针对真人的高风险深度伪造必须拒绝。"
+            "普通人、虚构角色、动漫角色和无法确认身份的人物不要误判。"
+            "只输出严格 JSON："
+            '{"allowed":true,"contains_real_person":false,'
+            '"contains_political_figure":false,"suspected_name":"",'
+            '"confidence":0.0,"reason":""}'
+        )
+        try:
+            response = await self.context.llm_generate(
+                chat_provider_id=self.reference_safety_provider_id,
+                prompt=prompt,
+                image_urls=image_urls,
+                request_max_retries=1,
+            )
+            raw = str(getattr(response, "completion_text", "") or "").strip()
+            match = re.search(r"\{.*\}", raw, flags=re.S)
+            payload = json.loads(match.group(0) if match else raw)
+            political = bool(payload.get("contains_political_figure", False))
+            allowed = bool(payload.get("allowed", not political)) and not political
+            if not allowed:
+                logger.warning(
+                    "参考图安全审核拦截: suspected=%s confidence=%s reason=%s",
+                    str(payload.get("suspected_name", ""))[:100],
+                    payload.get("confidence", ""),
+                    str(payload.get("reason", ""))[:300],
+                )
+            return {
+                "allowed": allowed,
+                "source": "reference_vision_provider",
+                "reason": str(payload.get("reason", "") or "参考图安全审核未通过"),
+            }
+        except Exception as exc:
+            logger.warning("参考图安全识别失败: %s", exc, exc_info=True)
+            if self.reference_safety_fail_closed:
+                return {
+                    "allowed": False,
+                    "reason": f"参考图安全识别暂时不可用：{type(exc).__name__}",
+                }
+            return {"allowed": True, "source": "reference_review_failed_open"}
 
     async def _review_prompt_before_generation(
         self,
@@ -1916,6 +1985,13 @@ class GeminiArtist(Star):
 
         try:
             images = await self._draw_reference_images(event)
+            reference_review = await self._review_reference_images_safety(images)
+            if not reference_review.get("allowed", True):
+                yield event.plain_result(
+                    "参考图未通过安全识别，已取消画图："
+                    + str(reference_review.get("reason", "包含高风险现实人物内容"))
+                )
+                return
             review = await self._review_prompt_before_generation(
                 event, prompt_text, images
             )

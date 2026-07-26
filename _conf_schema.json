@@ -88,6 +88,25 @@
     "description": "在真正调用画图接口前，先审核提示词和参考图，命中高风险内容则拒绝。",
     "default": true
   },
+  "enable_reference_safety_review": {
+    "type": "bool",
+    "title": "启用参考图人物安全识别",
+    "description": "带图 /draw 在生图前调用一次独立视觉 Provider，拦截现实政治人物和高风险真人深度伪造；不进入聊天会话。",
+    "default": true
+  },
+  "reference_safety_provider_id": {
+    "type": "string",
+    "title": "参考图安全识别 Provider",
+    "description": "必须选择支持图片理解的 Provider；仅用于参考图安全审核。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "reference_safety_fail_closed": {
+    "type": "bool",
+    "title": "参考图审核失败时拒绝画图",
+    "description": "识别模型未配置、超时或返回格式错误时拒绝带图画图，避免未经审核直接生成。",
+    "default": true
+  },
   "prompt_review_model": {
     "type": "string",
     "title": "审核模型名",
