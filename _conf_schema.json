@@ -91,7 +91,7 @@
   "enable_reference_safety_review": {
     "type": "bool",
     "title": "启用参考图人物安全识别",
-    "description": "带图 /draw 在生图前调用一次独立视觉 Provider，拦截现实政治人物和高风险真人深度伪造；不进入聊天会话。",
+    "description": "将最多9张用户参考图合成一张带编号总览图，只调用一次独立视觉 Provider，拦截现实政治人物和高风险真人深度伪造；不进入聊天会话。",
     "default": true
   },
   "reference_safety_provider_id": {

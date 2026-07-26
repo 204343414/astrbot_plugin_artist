@@ -10,7 +10,7 @@ import time
 import os
 import random
 from google import genai
-from PIL import Image as PILImage
+from PIL import Image as PILImage, ImageDraw, ImageOps
 from google.genai.types import HttpOptions
 from astrbot.core.utils.io import download_file
 import functools
@@ -27,7 +27,7 @@ class PromptSafetyBlockedError(Exception):
     """前置审核拒绝生图请求。"""
 
 
-@register("gemini_artist_plugin", "nichinichisou", "无会话 LLM 的一次性 OpenID 配额画图插件", "2.1.0")
+@register("gemini_artist_plugin", "nichinichisou", "无会话 LLM 的一次性 OpenID 配额画图插件", "2.1.1")
 class GeminiArtist(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -375,6 +375,39 @@ class GeminiArtist(Star):
             "raw": raw,
         }
 
+    @staticmethod
+    def _compose_reference_review_sheet(
+        images_pil: List[PILImage.Image], max_images: int = 9
+    ) -> PILImage.Image:
+        """Merge references into one labelled image for one vision review."""
+        images = list(images_pil[:max_images])
+        if not images:
+            raise ValueError("没有可合成的参考图")
+        count = len(images)
+        columns = 1 if count == 1 else 2 if count <= 4 else 3
+        rows = (count + columns - 1) // columns
+        cell_size = 512
+        label_height = 36
+        sheet = PILImage.new(
+            "RGB", (columns * cell_size, rows * (cell_size + label_height)), "white"
+        )
+        draw = ImageDraw.Draw(sheet)
+        for index, source in enumerate(images):
+            image = ImageOps.exif_transpose(source).convert("RGB")
+            fitted = ImageOps.contain(image, (cell_size, cell_size))
+            column = index % columns
+            row = index // columns
+            x = column * cell_size + (cell_size - fitted.width) // 2
+            y_base = row * (cell_size + label_height)
+            y = y_base + label_height + (cell_size - fitted.height) // 2
+            sheet.paste(fitted, (x, y))
+            draw.rectangle(
+                (column * cell_size, y_base, (column + 1) * cell_size, y_base + label_height),
+                fill=(235, 238, 242),
+            )
+            draw.text((column * cell_size + 12, y_base + 10), f"Reference {index + 1}", fill="black")
+        return sheet
+
     async def _review_reference_images_safety(
         self,
         images_pil: Optional[List[PILImage.Image]] = None,
@@ -391,16 +424,19 @@ class GeminiArtist(Star):
                 }
             return {"allowed": True, "source": "reference_review_unconfigured"}
 
-        image_urls = [self._pil_to_data_url(image) for image in images[:3]]
+        review_sheet = self._compose_reference_review_sheet(images, max_images=9)
+        image_urls = [self._pil_to_data_url(review_sheet)]
         prompt = (
-            "你是绘图参考图安全审核器。识别图片是否包含现实中的公众人物或政治人物。"
+            "你是绘图参考图安全审核器。输入是一张由多张用户参考图组成的总览图，"
+            "每格标注 Reference 编号。请逐格检查，再给出整组结论。"
+            "识别其中是否包含现实中的公众人物或政治人物。"
             "不要根据种族、国籍或普通人的长相猜身份；只有高度确信是知名现实人物时才填写姓名。"
             "现实政治人物、政治宣传素材、政治讽刺或针对真人的高风险深度伪造必须拒绝。"
             "普通人、虚构角色、动漫角色和无法确认身份的人物不要误判。"
             "只输出严格 JSON："
             '{"allowed":true,"contains_real_person":false,'
             '"contains_political_figure":false,"suspected_name":"",'
-            '"confidence":0.0,"reason":""}'
+            '"suspicious_references":[],"confidence":0.0,"reason":""}'
         )
         try:
             response = await self.context.llm_generate(
@@ -416,7 +452,8 @@ class GeminiArtist(Star):
             allowed = bool(payload.get("allowed", not political)) and not political
             if not allowed:
                 logger.warning(
-                    "参考图安全审核拦截: suspected=%s confidence=%s reason=%s",
+                    "参考图安全审核拦截: refs=%s suspected=%s confidence=%s reason=%s",
+                    payload.get("suspicious_references", []),
                     str(payload.get("suspected_name", ""))[:100],
                     payload.get("confidence", ""),
                     str(payload.get("reason", ""))[:300],
