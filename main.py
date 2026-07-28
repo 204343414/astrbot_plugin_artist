@@ -27,7 +27,7 @@ class PromptSafetyBlockedError(Exception):
     """前置审核拒绝生图请求。"""
 
 
-@register("gemini_artist_plugin", "nichinichisou", "无会话 LLM 的一次性 OpenID 配额画图插件", "2.1.1")
+@register("gemini_artist_plugin", "nichinichisou", "无会话 LLM 的一次性 OpenID 配额画图插件", "2.1.2")
 class GeminiArtist(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -178,6 +178,12 @@ class GeminiArtist(Star):
             if str(x).strip()
         ]
         self.local_blacklist_enabled = bool(config.get("local_blacklist_enabled", True))
+
+        # AstrBot 全局管理员（admins_id）在个人小群里直接跳过本插件的
+        # 生图前审核/参考图审核。本判断只使用当前平台实际暴露的发送者
+        # 标识：OneBot 等平台通常是 QQ 号，QQ Official 通常是 OpenID。
+        # QQ 号与 OpenID 之间没有可靠公开映射，因此不会臆猜转换。
+        self.admin_bypass_review = bool(config.get("admin_bypass_review", True))
         self.local_blacklist_store_key = "gemini_artist_local_blacklist"
         self.local_blacklist: Dict[str, Dict[str, Any]] = sp.get(self.local_blacklist_store_key, {}) or {}
 
@@ -207,6 +213,86 @@ class GeminiArtist(Star):
         }
         self._persist_local_blacklist()
         logger.warning(f"已将用户 {uid} 加入插件本地黑名单，原因: {reason}")
+
+    @staticmethod
+    def _parse_identifier_values(value: Any) -> set[str]:
+        if isinstance(value, (list, tuple, set)):
+            values = value
+        else:
+            values = re.split(r"[\s,，;；]+", str(value or ""))
+        return {str(item).strip() for item in values if str(item).strip()}
+
+    @staticmethod
+    def _event_sender_identifiers(event: AstrMessageEvent) -> set[str]:
+        """Return sender IDs exposed by the current platform without guessing.
+
+        OneBot/aiocqhttp generally exposes the numeric QQ id. QQ Official
+        generally exposes OpenID/member_openid. These namespaces cannot be
+        converted locally, so the check below intentionally only compares
+        identifiers that actually appear on the event.
+        """
+        candidates: set[str] = set()
+
+        def add(value: Any) -> None:
+            text = str(value or "").strip()
+            if text:
+                candidates.add(text)
+
+        try:
+            add(event.get_sender_id())
+        except Exception:
+            pass
+
+        message_obj = getattr(event, "message_obj", None)
+        sender = getattr(message_obj, "sender", None)
+        add(getattr(sender, "user_id", ""))
+        add(getattr(sender, "id", ""))
+
+        raw = getattr(message_obj, "raw_message", None)
+        add(getattr(raw, "group_member_openid", ""))
+        add(getattr(raw, "user_openid", ""))
+        add(getattr(raw, "openid", ""))
+        add(getattr(raw, "id", ""))
+        author = getattr(raw, "author", None)
+        add(getattr(author, "member_openid", ""))
+        add(getattr(author, "user_openid", ""))
+        add(getattr(author, "openid", ""))
+        add(getattr(author, "id", ""))
+        return candidates
+
+    def _astrbot_admin_identifiers(self, event: AstrMessageEvent) -> set[str]:
+        admins: set[str] = set()
+
+        # AstrBot global config, available on normal runtime context.
+        try:
+            cfg = getattr(self.context, "astrbot_config", None)
+            if cfg:
+                admins |= self._parse_identifier_values(cfg.get("admins_id", []))
+        except Exception:
+            pass
+
+        # Per-session merged config is what other plugins in this bot use.
+        try:
+            origin = str(getattr(event, "unified_msg_origin", "") or "")
+            cfg = self.context.get_config(umo=origin) if origin else self.context.get_config()
+            if cfg:
+                admins |= self._parse_identifier_values(cfg.get("admins_id", []))
+        except Exception:
+            pass
+
+        return admins
+
+    def _is_astrbot_admin_for_review_bypass(self, event: AstrMessageEvent) -> bool:
+        if not self.admin_bypass_review:
+            return False
+        try:
+            if event.is_admin():
+                return True
+        except Exception:
+            pass
+        sender_ids = self._event_sender_identifiers(event)
+        admin_ids = self._astrbot_admin_identifiers(event)
+        return bool(sender_ids & admin_ids)
 
     @staticmethod
     def _to_plain_dict(obj: Any) -> Dict[str, Any]:
@@ -411,8 +497,11 @@ class GeminiArtist(Star):
     async def _review_reference_images_safety(
         self,
         images_pil: Optional[List[PILImage.Image]] = None,
+        event: Optional[AstrMessageEvent] = None,
     ) -> Dict[str, Any]:
         """One independent vision review; never enters the chat conversation."""
+        if event is not None and self._is_astrbot_admin_for_review_bypass(event):
+            return {"allowed": True, "source": "astrbot_admin_bypass"}
         images = list(images_pil or [])
         if not images or not self.enable_reference_safety_review:
             return {"allowed": True, "source": "reference_review_not_needed"}
@@ -478,6 +567,8 @@ class GeminiArtist(Star):
         prompt_text: str,
         images_pil: Optional[List[PILImage.Image]] = None,
     ) -> Dict[str, Any]:
+        if self._is_astrbot_admin_for_review_bypass(event):
+            return {"allowed": True, "source": "astrbot_admin_bypass"}
         if not self.enable_prompt_review:
             return {"allowed": True, "source": "disabled"}
 
@@ -2022,7 +2113,7 @@ class GeminiArtist(Star):
 
         try:
             images = await self._draw_reference_images(event)
-            reference_review = await self._review_reference_images_safety(images)
+            reference_review = await self._review_reference_images_safety(images, event=event)
             if not reference_review.get("allowed", True):
                 yield event.plain_result(
                     "参考图未通过安全识别，已取消画图："

@@ -88,6 +88,12 @@
     "description": "在真正调用画图接口前，先审核提示词和参考图，命中高风险内容则拒绝。",
     "default": true
   },
+  "admin_bypass_review": {
+    "type": "bool",
+    "title": "AstrBot 管理员跳过生图审核",
+    "description": "开启后，AstrBot 全局 admins_id 中的管理员直接跳过本插件的生图前提示词审核和参考图安全识别。OneBot 等平台按 QQ 号匹配，QQ 官方按 OpenID/member_openid 匹配；QQ号和OpenID不会相互猜测转换。",
+    "default": true
+  },
   "enable_reference_safety_review": {
     "type": "bool",
     "title": "启用参考图人物安全识别",
