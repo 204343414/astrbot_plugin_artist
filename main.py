@@ -330,6 +330,27 @@ class GeminiArtist(Star):
         img.save(buf, format="JPEG", quality=90)
         return f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
 
+    def _publish_or_wrap_image(self, img_path: str, slot: str = "") -> Tuple[Optional[Any], Optional[str]]:
+        """优先借用 QQOfficial Hub 图床发布 URL；否则回退至本地文件"""
+        if not img_path or not os.path.exists(img_path) or os.path.getsize(img_path) <= 0:
+            return None, None
+
+        use_image_host = self.config.get("use_image_host", True)
+        if use_image_host:
+            import builtins
+            host = getattr(builtins, "_qqhub_image_host_live", None)
+            if host and getattr(host, "configured", False) and getattr(host, "running", False):
+                try:
+                    with open(img_path, "rb") as fp:
+                        raw_bytes = fp.read()
+                    uploaded_url = host.publish(raw_bytes, slot=slot)
+                    logger.info(f"[Artist] 图片已成功发布到图床: {uploaded_url}")
+                    return Image.fromURL(uploaded_url), uploaded_url
+                except Exception as exc:
+                    logger.warning(f"[Artist] 发布图片到图床失败，降级本地文件: {exc}")
+
+        return Image.fromFileSystem(img_path), None
+
     def _review_prompt_via_local_rules(self, prompt_text: str) -> Dict[str, Any]:
         lowered_prompt = (prompt_text or "").lower()
 
@@ -1609,11 +1630,19 @@ class GeminiArtist(Star):
             # ===== 单图：直接发图 =====
             if len(image_paths) < 2:
                 chain = []
-                for img_path in image_paths:
-                    if img_path and os.path.exists(img_path) and os.path.getsize(img_path) > 0:
-                        chain.append(Image.fromFileSystem(img_path))
+                uploaded_urls = []
+                for i, img_path in enumerate(image_paths):
+                    comp, url = self._publish_or_wrap_image(img_path, slot=f"artist_{command_sender_id}_{i}")
+                    if comp:
+                        chain.append(comp)
+                    if url:
+                        uploaded_urls.append(url)
 
                 if chain:
+                    if uploaded_urls and self.config.get("append_download_url", True):
+                        for url in uploaded_urls:
+                            chain.append(Plain(f"\n🔗 高清原图下载: {url}"))
+
                     cost, spent_today, remaining, cost_info = self._record_spending_and_format(budget_group_id, len(image_paths))
 
                     image_desc = text_response if text_response else "（API未返回文字描述，但图片已成功生成并发送）"
@@ -1656,11 +1685,18 @@ class GeminiArtist(Star):
 
             if bot_id_for_node is None:
                 chain = []
+                uploaded_urls = []
                 if text_response:
                     chain.append(Plain(text_response))
-                for img_path in image_paths:
-                    if img_path and os.path.exists(img_path) and os.path.getsize(img_path) > 0:
-                        chain.append(Image.fromFileSystem(img_path))
+                for i, img_path in enumerate(image_paths):
+                    comp, url = self._publish_or_wrap_image(img_path, slot=f"artist_{command_sender_id}_{i}")
+                    if comp:
+                        chain.append(comp)
+                    if url:
+                        uploaded_urls.append(url)
+                if uploaded_urls and self.config.get("append_download_url", True):
+                    for url in uploaded_urls:
+                        chain.append(Plain(f"\n🔗 高清原图下载: {url}"))
                 if chain:
                     yield event.chain_result(chain)
                 else:
@@ -1673,9 +1709,13 @@ class GeminiArtist(Star):
             if text_response:
                 ns.nodes.append(Node(user_id=bot_id_for_node, nickname=bot_name_for_node, content=[Plain(text_response)]))
 
-            for img_path in image_paths:
-                if img_path and os.path.exists(img_path) and os.path.getsize(img_path) > 0:
-                    ns.nodes.append(Node(user_id=bot_id_for_node, nickname=bot_name_for_node, content=[Image.fromFileSystem(img_path)]))
+            for i, img_path in enumerate(image_paths):
+                comp, url = self._publish_or_wrap_image(img_path, slot=f"artist_{command_sender_id}_{i}")
+                if comp:
+                    node_content = [comp]
+                    if url and self.config.get("append_download_url", True):
+                        node_content.append(Plain(f"\n🔗 高清原图下载: {url}"))
+                    ns.nodes.append(Node(user_id=bot_id_for_node, nickname=bot_name_for_node, content=node_content))
 
             if ns.nodes:
                 cost, spent_today, remaining, cost_info = self._record_spending_and_format(budget_group_id, len(image_paths))
@@ -1859,8 +1899,12 @@ class GeminiArtist(Star):
                 "user_instruction_for_llm": f"角色反应图已成功生成并发送！不要再次调用任何画图工具！场景：{scene_description}。{cost_info}"
             }, ensure_ascii=False)
             # 然后发图片和预算提示给用户
-            chain = [Image.fromFileSystem(image_path)]
-            await event.send(event.chain_result(chain))
+            comp, url = self._publish_or_wrap_image(image_path, slot=f"reaction_{command_sender_id}")
+            chain = [comp] if comp else []
+            if url and self.config.get("append_download_url", True):
+                chain.append(Plain(f"\n🔗 高清原图下载: {url}"))
+            if chain:
+                await event.send(event.chain_result(chain))
             if cost_info:
                 await event.send(event.plain_result(cost_info))
             await self._post_image_commentary_once(event, scene_description, f"角色反应图场景：{scene_description}")
@@ -2048,7 +2092,12 @@ class GeminiArtist(Star):
                 "user_instruction_for_llm": f"图片合并完成并已发送给用户。{cost_info}。请勿重复调用。"
             }, ensure_ascii=False)
             # 然后发图片
-            await event.send(event.chain_result(chain))
+            comp, url = self._publish_or_wrap_image(image_path, slot=f"combine_{command_sender_id}")
+            chain = [comp] if comp else []
+            if url and self.config.get("append_download_url", True):
+                chain.append(Plain(f"\n🔗 高清原图下载: {url}"))
+            if chain:
+                await event.send(event.chain_result(chain))
             if cost_info:
                 await event.send(event.plain_result(cost_info))
             await self._post_image_commentary_once(event, prompt, "多图合并结果已发送")

@@ -1,4 +1,16 @@
 {
+  "use_image_host": {
+    "type": "bool",
+    "title": "启用图床外链发图 (QQOfficial Hub)",
+    "description": "画图成功后，自动将图片发布至 QQOfficial Hub 图床（保存1小时），以 URL 形式发送，避免大图上传失败。",
+    "default": true
+  },
+  "append_download_url": {
+    "type": "bool",
+    "title": "附带公网下载直链文本",
+    "description": "发送图片时同时附带高清原图网页直链，方便用户在浏览器中点击查看或下载（1小时后自动过期）。",
+    "default": true
+  },
   "api_type": {
     "description": "API类型",
     "type": "string",
