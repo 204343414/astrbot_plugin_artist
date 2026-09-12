@@ -494,16 +494,32 @@ class GeminiArtist(Star):
                 "msg_type": 7,
                 "msg_id": event.message_obj.message_id,
                 "msg_seq": random.randint(1, 10000),
-                "content": content or " ",
                 "media": media,
             }
+            if content:
+                msg_payload["content"] = content
+
             send_res = await http_client.request(
                 Route("POST", msg_path, **msg_kwargs), json=msg_payload
             )
-            return send_res is not None
+            if send_res is not None:
+                try:
+                    event._has_send_oper = True
+                except Exception:
+                    pass
+                return True
+            return False
         except Exception as exc:
             logger.warning(f"[Artist] QQ官方分片上传发图失败: {exc}")
             return False
+
+    def _is_qq_official_event(self, event: AstrMessageEvent) -> bool:
+        if getattr(event, "bot", None) and getattr(event.bot, "api", None) and hasattr(event.bot.api, "_http"):
+            return True
+        source = getattr(event.message_obj, "raw_message", None)
+        if source and (getattr(source, "group_openid", None) or getattr(source, "openid", None) or getattr(source, "user_openid", None)):
+            return True
+        return False
 
     async def _send_image_message(
         self,
@@ -511,9 +527,21 @@ class GeminiArtist(Star):
         image_path: str,
         caption: str = "",
     ) -> bool:
-        """自适应发图：QQ官方平台优先分片直传，其他平台或分片失败则走普通消息链"""
-        if await self._send_qq_official_image_chunked(event, image_path, content=caption):
-            return True
+        """自适应发图：QQ官方平台优先分片直传，其他平台走普通消息链"""
+        if self._is_qq_official_event(event):
+            try:
+                ok = await self._send_qq_official_image_chunked(event, image_path, content=caption)
+                if ok:
+                    try:
+                        event._has_send_oper = True
+                    except Exception:
+                        pass
+                    return True
+                logger.warning("[Artist] QQ官方分片发图未成功，不再回退至 Base64 上传以避免重试卡死")
+                return False
+            except Exception as exc:
+                logger.warning(f"[Artist] QQ官方分片发图异常: {exc}")
+                return False
 
         chain = []
         if caption:
@@ -1838,7 +1866,31 @@ class GeminiArtist(Star):
                         yield event.plain_result("抱歉，未能生成有效内容。")
                 return
 
-            # ===== 多图：Nodes 合并转发 =====
+            # ===== 多图：QQ 官方平台逐张直传，其他平台 Nodes 合并转发 =====
+            if self._is_qq_official_event(event):
+                cost, spent_today, remaining, cost_info = self._record_spending_and_format(budget_group_id, len(image_paths))
+                image_desc = text_response if text_response else "（API未返回文字描述，但图片已成功生成并发送）"
+                tool_output_data = {
+                    "success": True,
+                    "image_already_sent": True,
+                    "image_description": image_desc,
+                    "number_of_images_generated": len(image_paths),
+                    "cost_this_time": cost,
+                    "budget_spent_today": spent_today,
+                    "budget_remaining": remaining,
+                    "user_instruction_for_llm": f"你已亲自生成并发送全部图片（你是作者）。禁止再次调用画图工具。图片内容：{image_desc}。{cost_info}"
+                }
+                yield json.dumps(tool_output_data, ensure_ascii=False)
+                if text_response:
+                    await event.send(event.plain_result(text_response))
+                for img_path in image_paths:
+                    if img_path and os.path.exists(img_path) and os.path.getsize(img_path) > 0:
+                        await self._send_image_message(event, img_path)
+                if cost_info:
+                    await event.send(event.plain_result(cost_info))
+                await self._post_image_commentary_once(event, prompt, image_desc)
+                return
+
             bot_id_for_node_str = event.message_obj.self_id or self.robot_id_from_config or self.config.get("bot_id")
             bot_id_for_node = int(str(bot_id_for_node_str).strip()) if bot_id_for_node_str and str(bot_id_for_node_str).strip().isdigit() else None
 
@@ -2328,9 +2380,10 @@ class GeminiArtist(Star):
                 yield event.plain_result("画图失败：生成接口没有返回有效图片。")
                 return
             self._record_user_draw(user_openid)
-            # QQ Official local media may split multiple images into messages;
-            # emit exactly one final image to preserve one-operation/one-message.
-            yield event.image_result(image_path)
+            # 自适应发图：QQ官方走分片直传，其他平台走普通消息链
+            sent = await self._send_image_message(event, image_path)
+            if not sent and not self._is_qq_official_event(event):
+                yield event.image_result(image_path)
         except PromptSafetyBlockedError:
             yield event.plain_result(self.prompt_review_block_message)
         except Exception as exc:
