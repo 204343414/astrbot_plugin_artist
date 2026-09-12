@@ -5,6 +5,8 @@ from astrbot.api import logger, sp
 from astrbot.api.all import *
 from astrbot.api.message_components import Node, Plain, Image, Nodes, Reply, BaseMessageComponent
 import asyncio
+import aiohttp
+import hashlib
 from io import BytesIO
 import time
 import os
@@ -330,26 +332,195 @@ class GeminiArtist(Star):
         img.save(buf, format="JPEG", quality=90)
         return f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
 
-    def _publish_or_wrap_image(self, img_path: str, slot: str = "") -> Tuple[Optional[Any], Optional[str]]:
-        """优先借用 QQOfficial Hub 图床发布 URL；否则回退至本地文件"""
-        if not img_path or not os.path.exists(img_path) or os.path.getsize(img_path) <= 0:
-            return None, None
+    @staticmethod
+    def _file_hashes(path: str) -> tuple[str, str, str]:
+        md5 = hashlib.md5()
+        sha1 = hashlib.sha1()
+        md5_10m = hashlib.md5()
+        remaining_10m = 10_002_432
+        with open(path, "rb") as file_obj:
+            while True:
+                chunk = file_obj.read(1024 * 1024)
+                if not chunk:
+                    break
+                md5.update(chunk)
+                sha1.update(chunk)
+                if remaining_10m > 0:
+                    head = chunk[:remaining_10m]
+                    md5_10m.update(head)
+                    remaining_10m -= len(head)
+        return md5.hexdigest(), sha1.hexdigest(), md5_10m.hexdigest()
 
-        use_image_host = self.config.get("use_image_host", True)
-        if use_image_host:
-            import builtins
-            host = getattr(builtins, "_qqhub_image_host_live", None)
-            if host and getattr(host, "configured", False) and getattr(host, "running", False):
-                try:
-                    with open(img_path, "rb") as fp:
-                        raw_bytes = fp.read()
-                    uploaded_url = host.publish(raw_bytes, slot=slot)
-                    logger.info(f"[Artist] 图片已成功发布到图床: {uploaded_url}")
-                    return Image.fromURL(uploaded_url), uploaded_url
-                except Exception as exc:
-                    logger.warning(f"[Artist] 发布图片到图床失败，降级本地文件: {exc}")
+    async def _send_qq_official_image_chunked(
+        self,
+        event: AstrMessageEvent,
+        image_path: str,
+        content: str = "",
+    ) -> bool:
+        """针对 QQ 官方机器人平台，使用官方分片直传 API 发送大图"""
+        if not image_path or not os.path.exists(image_path) or os.path.getsize(image_path) <= 0:
+            return False
 
-        return Image.fromFileSystem(img_path), None
+        bot = getattr(event, "bot", None)
+        api = getattr(bot, "api", None)
+        http_client = getattr(api, "_http", None)
+        if not http_client:
+            return False
+
+        try:
+            from botpy.http import Route
+            from botpy.types.message import Media
+        except ImportError:
+            return False
+
+        source = getattr(event.message_obj, "raw_message", None)
+        group_openid = str(getattr(source, "group_openid", "") or "")
+        author = getattr(source, "author", None)
+        user_openid = str(
+            getattr(author, "user_openid", "")
+            or getattr(source, "openid", "")
+            or getattr(source, "user_openid", "")
+            or ""
+        )
+
+        if group_openid:
+            target_id = group_openid
+            prepare_path = "/v2/groups/{group_id}/upload_prepare"
+            finish_path = "/v2/groups/{group_id}/upload_part_finish"
+            files_path = "/v2/groups/{group_openid}/files"
+            msg_path = "/v2/groups/{group_openid}/messages"
+            prepare_kwargs = {"group_id": target_id}
+            finish_kwargs = {"group_id": target_id}
+            files_kwargs = {"group_openid": target_id}
+            msg_kwargs = {"group_openid": target_id}
+        elif user_openid:
+            target_id = user_openid
+            prepare_path = "/v2/users/{user_id}/upload_prepare"
+            finish_path = "/v2/users/{user_id}/upload_part_finish"
+            files_path = "/v2/users/{user_openid}/files"
+            msg_path = "/v2/users/{openid}/messages"
+            prepare_kwargs = {"user_id": target_id}
+            finish_kwargs = {"user_id": target_id}
+            files_kwargs = {"user_openid": target_id}
+            msg_kwargs = {"openid": target_id}
+        else:
+            return False
+
+        try:
+            file_size = os.path.getsize(image_path)
+            file_name = os.path.basename(image_path) or f"art_{int(time.time())}.jpg"
+            md5, sha1, md5_10m = self._file_hashes(image_path)
+
+            prepare_payload = {
+                "file_type": 1,
+                "file_size": str(file_size),
+                "file_name": file_name,
+                "md5": md5,
+                "sha1": sha1,
+                "md5_10m": md5_10m,
+            }
+
+            prepare = await http_client.request(
+                Route("POST", prepare_path, **prepare_kwargs), json=prepare_payload
+            )
+            if not isinstance(prepare, dict) or not prepare.get("upload_id"):
+                return False
+
+            upload_id = str(prepare["upload_id"])
+            block_size = int(prepare.get("block_size") or 5 * 1024 * 1024)
+            parts = prepare.get("parts") or []
+            upload_config = prepare.get("upload_config") or {}
+            retry_timeout = int(upload_config.get("retry_timeout") or 300)
+
+            timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=retry_timeout)
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                with open(image_path, "rb") as file_obj:
+                    uploaded_bytes = 0
+                    for order, part in enumerate(
+                        sorted(parts, key=lambda item: int(item.get("index", 0)))
+                    ):
+                        index = int(part.get("index", order))
+                        presigned_url = str(part.get("presigned_url") or "")
+                        if not presigned_url:
+                            return False
+                        part_size = int(part.get("block_size") or block_size)
+                        remaining = file_size - uploaded_bytes
+                        if remaining <= 0:
+                            break
+                        file_obj.seek(uploaded_bytes)
+                        data = file_obj.read(min(part_size, remaining))
+                        if not data:
+                            return False
+
+                        async with session.put(
+                            presigned_url,
+                            data=data,
+                            headers={"Content-Type": "application/octet-stream"},
+                        ) as resp:
+                            if resp.status not in (200, 201, 204):
+                                return False
+
+                        part_md5 = hashlib.md5(data).hexdigest()
+                        await http_client.request(
+                            Route("POST", finish_path, **finish_kwargs),
+                            json={
+                                "upload_id": upload_id,
+                                "part_index": index,
+                                "block_size": str(len(data)),
+                                "md5": part_md5,
+                            },
+                        )
+                        uploaded_bytes += len(data)
+
+            complete_payload = {
+                "file_type": 1,
+                "srv_send_msg": False,
+                "file_name": file_name,
+                "upload_id": upload_id,
+            }
+            complete = await http_client.request(
+                Route("POST", files_path, **files_kwargs), json=complete_payload
+            )
+            if not isinstance(complete, dict) or not complete.get("file_info"):
+                return False
+
+            media = Media(
+                file_uuid=complete.get("file_uuid", ""),
+                file_info=complete["file_info"],
+                ttl=complete.get("ttl", 0),
+            )
+
+            msg_payload = {
+                "msg_type": 7,
+                "msg_id": event.message_obj.message_id,
+                "msg_seq": random.randint(1, 10000),
+                "content": content or " ",
+                "media": media,
+            }
+            send_res = await http_client.request(
+                Route("POST", msg_path, **msg_kwargs), json=msg_payload
+            )
+            return send_res is not None
+        except Exception as exc:
+            logger.warning(f"[Artist] QQ官方分片上传发图失败: {exc}")
+            return False
+
+    async def _send_image_message(
+        self,
+        event: AstrMessageEvent,
+        image_path: str,
+        caption: str = "",
+    ) -> bool:
+        """自适应发图：QQ官方平台优先分片直传，其他平台或分片失败则走普通消息链"""
+        if await self._send_qq_official_image_chunked(event, image_path, content=caption):
+            return True
+
+        chain = []
+        if caption:
+            chain.append(Plain(caption))
+        chain.append(Image.fromFileSystem(image_path))
+        await event.send(event.chain_result(chain))
+        return True
 
     def _review_prompt_via_local_rules(self, prompt_text: str) -> Dict[str, Any]:
         lowered_prompt = (prompt_text or "").lower()
@@ -1629,20 +1800,8 @@ class GeminiArtist(Star):
 
             # ===== 单图：直接发图 =====
             if len(image_paths) < 2:
-                chain = []
-                uploaded_urls = []
-                for i, img_path in enumerate(image_paths):
-                    comp, url = self._publish_or_wrap_image(img_path, slot=f"artist_{command_sender_id}_{i}")
-                    if comp:
-                        chain.append(comp)
-                    if url:
-                        uploaded_urls.append(url)
-
-                if chain:
-                    if uploaded_urls and self.config.get("append_download_url", True):
-                        for url in uploaded_urls:
-                            chain.append(Plain(f"\n🔗 高清原图下载: {url}"))
-
+                img_path = image_paths[0] if image_paths else None
+                if img_path and os.path.exists(img_path) and os.path.getsize(img_path) > 0:
                     cost, spent_today, remaining, cost_info = self._record_spending_and_format(budget_group_id, len(image_paths))
 
                     image_desc = text_response if text_response else "（API未返回文字描述，但图片已成功生成并发送）"
@@ -1665,8 +1824,8 @@ class GeminiArtist(Star):
                     # 先 yield 给 LLM（工具返回）
                     yield json.dumps(tool_output_data, ensure_ascii=False)
 
-                    # 再发给用户
-                    await event.send(event.chain_result(chain))
+                    # 再发给用户（支持官方分片直传与通用消息链）
+                    await self._send_image_message(event, img_path)
                     if cost_info:
                         await event.send(event.plain_result(cost_info))
 
@@ -1685,18 +1844,11 @@ class GeminiArtist(Star):
 
             if bot_id_for_node is None:
                 chain = []
-                uploaded_urls = []
                 if text_response:
                     chain.append(Plain(text_response))
-                for i, img_path in enumerate(image_paths):
-                    comp, url = self._publish_or_wrap_image(img_path, slot=f"artist_{command_sender_id}_{i}")
-                    if comp:
-                        chain.append(comp)
-                    if url:
-                        uploaded_urls.append(url)
-                if uploaded_urls and self.config.get("append_download_url", True):
-                    for url in uploaded_urls:
-                        chain.append(Plain(f"\n🔗 高清原图下载: {url}"))
+                for img_path in image_paths:
+                    if img_path and os.path.exists(img_path) and os.path.getsize(img_path) > 0:
+                        chain.append(Image.fromFileSystem(img_path))
                 if chain:
                     yield event.chain_result(chain)
                 else:
@@ -1709,13 +1861,9 @@ class GeminiArtist(Star):
             if text_response:
                 ns.nodes.append(Node(user_id=bot_id_for_node, nickname=bot_name_for_node, content=[Plain(text_response)]))
 
-            for i, img_path in enumerate(image_paths):
-                comp, url = self._publish_or_wrap_image(img_path, slot=f"artist_{command_sender_id}_{i}")
-                if comp:
-                    node_content = [comp]
-                    if url and self.config.get("append_download_url", True):
-                        node_content.append(Plain(f"\n🔗 高清原图下载: {url}"))
-                    ns.nodes.append(Node(user_id=bot_id_for_node, nickname=bot_name_for_node, content=node_content))
+            for img_path in image_paths:
+                if img_path and os.path.exists(img_path) and os.path.getsize(img_path) > 0:
+                    ns.nodes.append(Node(user_id=bot_id_for_node, nickname=bot_name_for_node, content=[Image.fromFileSystem(img_path)]))
 
             if ns.nodes:
                 cost, spent_today, remaining, cost_info = self._record_spending_and_format(budget_group_id, len(image_paths))
@@ -1898,13 +2046,8 @@ class GeminiArtist(Star):
                 "budget_remaining": remaining,
                 "user_instruction_for_llm": f"角色反应图已成功生成并发送！不要再次调用任何画图工具！场景：{scene_description}。{cost_info}"
             }, ensure_ascii=False)
-            # 然后发图片和预算提示给用户
-            comp, url = self._publish_or_wrap_image(image_path, slot=f"reaction_{command_sender_id}")
-            chain = [comp] if comp else []
-            if url and self.config.get("append_download_url", True):
-                chain.append(Plain(f"\n🔗 高清原图下载: {url}"))
-            if chain:
-                await event.send(event.chain_result(chain))
+            # 然后发图片和预算提示给用户（自适应支持官方分片直传）
+            await self._send_image_message(event, image_path)
             if cost_info:
                 await event.send(event.plain_result(cost_info))
             await self._post_image_commentary_once(event, scene_description, f"角色反应图场景：{scene_description}")
@@ -2091,13 +2234,8 @@ class GeminiArtist(Star):
                 "budget_remaining": remaining,
                 "user_instruction_for_llm": f"图片合并完成并已发送给用户。{cost_info}。请勿重复调用。"
             }, ensure_ascii=False)
-            # 然后发图片
-            comp, url = self._publish_or_wrap_image(image_path, slot=f"combine_{command_sender_id}")
-            chain = [comp] if comp else []
-            if url and self.config.get("append_download_url", True):
-                chain.append(Plain(f"\n🔗 高清原图下载: {url}"))
-            if chain:
-                await event.send(event.chain_result(chain))
+            # 然后发图片（自适应支持官方分片直传）
+            await self._send_image_message(event, image_path)
             if cost_info:
                 await event.send(event.plain_result(cost_info))
             await self._post_image_commentary_once(event, prompt, "多图合并结果已发送")
