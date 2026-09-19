@@ -29,7 +29,7 @@ class PromptSafetyBlockedError(Exception):
     """前置审核拒绝生图请求。"""
 
 
-@register("gemini_artist_plugin", "nichinichisou", "无会话 LLM 的一次性 OpenID 配额画图插件", "2.1.2")
+@register("gemini_artist_plugin", "nichinichisou", "无会话 LLM 的一次性 OpenID 配额画图插件", "2.1.3")
 class GeminiArtist(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -1000,11 +1000,28 @@ class GeminiArtist(Star):
             or "Project-scoped image upload failed" in msg
         )
 
+    @staticmethod
+    def _openai_size_for_aspect_ratio(aspect_ratio: str) -> str:
+        """Convert the tool ratio to an OpenAI Images API ``size`` value.
+
+        ``auto`` must be forwarded unchanged.  Previously it fell through to
+        1024x1024, which silently forced every /draw request to be square and
+        prevented GPT Image from choosing a suitable canvas for the prompt.
+        """
+        ratio = str(aspect_ratio or "auto").strip().lower()
+        if ratio == "auto":
+            return "auto"
+        if ratio in ("9:16", "3:4"):
+            return "1024x1536"
+        if ratio in ("16:9", "4:3"):
+            return "1536x1024"
+        return "1024x1024"
+
     async def openai_image_generate(
         self,
         text_prompt: str,
         images_pil: Optional[List[PILImage.Image]] = None,
-        aspect_ratio: str = "1:1",
+        aspect_ratio: str = "auto",
     ) -> Dict[str, Any]:
         """
         OpenAI gpt-image-2 生图/改图：
@@ -1020,14 +1037,9 @@ class GeminiArtist(Star):
 
         images_pil = images_pil or []
 
-        # 最稳尺寸：避免不同网关/中转对“任意尺寸”兼容问题
-        # OpenAI 图片指南里常用竖横方三档；quality 支持 auto/low/medium/high。 <!--citation:2-->
-        if aspect_ratio in ("9:16", "3:4"):
-            size = "1024x1536"
-        elif aspect_ratio in ("16:9", "4:3"):
-            size = "1536x1024"
-        else:
-            size = "1024x1024"
+        # /draw 会传入 auto；把它原样交给 Images API，让模型根据提示词
+        # 自行选择画布。只有用户明确指定比例时才固定为横/竖/方尺寸。
+        size = self._openai_size_for_aspect_ratio(aspect_ratio)
 
         quality = str(self.config.get("openai_image_quality", "auto")).strip() or "auto"
 
@@ -1654,7 +1666,7 @@ class GeminiArtist(Star):
         prompt: str,
         image_index: int = 0,
         reference_bot: bool = False,
-        aspect_ratio: str = "1:1"
+        aspect_ratio: str = "auto"
     ) -> AsyncGenerator[Any, None]:
         '''
         AI图像生成与编辑工具。支持文生图、图生图、图像编辑等多种功能。
@@ -1662,7 +1674,7 @@ class GeminiArtist(Star):
             prompt (string): 图像生成或编辑的详细描述。
             image_index (number, optional): 引用历史图片数量。0=不引用，1=引用最新1张，2=引用最新2张。默认0。
             reference_bot (boolean, optional): 是否引用机器人之前生成的图片。默认False。
-            aspect_ratio (string, optional): 图片宽高比。可选: "1:1"(方形), "16:9"(横屏), "9:16"(竖屏), "4:3"(横向), "3:4"(竖向)。默认"1:1"。
+            aspect_ratio (string, optional): 图片宽高比。可选: "auto"(由API决定), "1:1"(方形), "16:9"(横屏), "9:16"(竖屏), "4:3"(横向), "3:4"(竖向)。默认"auto"。
         '''
         if not self.api_keys:
             yield event.plain_result("请联系管理员配置API密钥。")

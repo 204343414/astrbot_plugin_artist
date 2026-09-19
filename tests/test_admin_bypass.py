@@ -154,5 +154,41 @@ class AdminBypassTests(unittest.TestCase):
         self.assertFalse(plugin._is_astrbot_admin_for_review_bypass(self.event(sender="member")))
 
 
+class OpenAIImageSizeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = load_main()
+
+    def test_auto_is_forwarded_to_api(self):
+        self.assertEqual(
+            self.mod.GeminiArtist._openai_size_for_aspect_ratio("auto"),
+            "auto",
+        )
+
+    def test_missing_ratio_defaults_to_auto(self):
+        self.assertEqual(
+            self.mod.GeminiArtist._openai_size_for_aspect_ratio(""),
+            "auto",
+        )
+        self.assertEqual(
+            self.mod.GeminiArtist._openai_size_for_aspect_ratio(None),
+            "auto",
+        )
+
+    def test_explicit_ratios_still_use_fixed_sizes(self):
+        self.assertEqual(
+            self.mod.GeminiArtist._openai_size_for_aspect_ratio("16:9"),
+            "1536x1024",
+        )
+        self.assertEqual(
+            self.mod.GeminiArtist._openai_size_for_aspect_ratio("9:16"),
+            "1024x1536",
+        )
+        self.assertEqual(
+            self.mod.GeminiArtist._openai_size_for_aspect_ratio("1:1"),
+            "1024x1024",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
