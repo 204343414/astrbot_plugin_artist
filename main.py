@@ -1121,6 +1121,9 @@ class GeminiArtist(Star):
                 b64 = getattr(item0, "b64_json", None) or (
                     item0.get("b64_json") if isinstance(item0, dict) else None
                 )
+                item_url = getattr(item0, "url", None) or (
+                    item0.get("url") if isinstance(item0, dict) else None
+                )
                 revised = getattr(item0, "revised_prompt", None) or (
                     item0.get("revised_prompt") if isinstance(item0, dict) else None
                 )
@@ -1129,16 +1132,39 @@ class GeminiArtist(Star):
                 if revised:
                     result["text"] = str(revised).strip()
 
-                if not b64:
-                    raise ValueError("OpenAI 图片API未返回 b64_json")
+                if not b64 and not item_url:
+                    # 打印响应字段，方便排查网关/中转站返回了什么
+                    item_keys = (
+                        list(item0.keys())
+                        if isinstance(item0, dict)
+                        else [a for a in dir(item0) if not a.startswith("_")]
+                    )
+                    raise ValueError(
+                        f"OpenAI 图片API未返回 b64_json 或 url (data[0]字段: {item_keys})"
+                    )
 
-                img_bytes = self._safe_b64decode(b64)
                 os.makedirs(self.temp_dir, exist_ok=True)
                 out_fp = os.path.join(
                     self.temp_dir, f"openai_gen_{time.time()}_{random.randint(100,999)}.png"
                 )
-                with open(out_fp, "wb") as f:
-                    f.write(img_bytes)
+
+                if b64:
+                    img_bytes = self._safe_b64decode(b64)
+                    with open(out_fp, "wb") as f:
+                        f.write(img_bytes)
+                else:
+                    # 官方 gpt-image-* 总是返回 b64_json；但 DALL·E 系列默认
+                    # response_format=url，很多中转站/网关也只回 url。
+                    # 这里统一兜底：下载 URL 后按 PNG 落盘。
+                    logger.info(f"OpenAI 图片API返回 url，改为下载: {item_url}")
+                    pil_img = await self.download_pil_image_from_url(
+                        item_url, "OpenAI生成的图片"
+                    )
+                    if pil_img is None:
+                        raise ValueError(
+                            f"OpenAI 图片API返回 url 但下载失败: {item_url}"
+                        )
+                    pil_img.save(out_fp, format="PNG")
 
                 result["image_paths"].append(out_fp)
 
