@@ -57,6 +57,18 @@ def _run_harness(script_path: Path, bridge_delay_ms: int) -> subprocess.Complete
         global.window = { setTimeout, clearTimeout };
         global.window.self = global.window;
         global.window.top = global.window;
+        // 复刻真实沙盒：allow-scripts 但**没有** allow-same-origin →
+        // window.parent 是跨域对象，读任何属性都抛 SecurityError（不是 undefined！）
+        global.window.parent = new Proxy({}, {
+          get() {
+            const err = new Error(
+              'Permission denied to access property on cross-origin object'
+            );
+            err.name = 'SecurityError';
+            throw err;
+          },
+          has() { return false; },
+        });
 
         let calls = 0;
         setTimeout(() => {
@@ -96,6 +108,53 @@ def test_page_recovers_when_bridge_arrives_late(delay):
     assert calls > 0, f"桥接层晚到 {delay}ms 时页面没恢复（apiGet 一次都没调）"
 
 
+def test_runs_inside_cross_origin_sandbox():
+    """在「window.parent 是跨域对象」的环境里，页面照样能把数据读出来。
+
+    这是真机报错的原样复刻：读 parent 的属性会抛 SecurityError。
+    上面所有行为测试都已经在这个环境下跑（harness 里把 parent 做成了会抛错的
+    Proxy），这条只是把意图写明，免得以后有人把 Proxy 删了还不知道为什么留着。
+    """
+    result = _run_harness(APP_JS, 0)
+    assert result.returncode == 0, result.stderr[-800:]
+    calls = json.loads(result.stdout.strip().splitlines()[-1])["calls"]
+    assert calls > 0, "跨域沙盒里页面没能读到数据"
+
+
+def test_never_touches_window_parent():
+    """绝对不能读 `window.parent` 的任何属性。
+
+    面板给 iframe 的 sandbox 是 `allow-scripts allow-forms allow-downloads`，
+    **没有 allow-same-origin** → `window.parent` 是跨域对象，**读一下属性就抛
+    SecurityError**（不是返回 undefined，可选链 `?.` 也挡不住）：
+
+        Permission denied to access property "AstrBotPluginPage" on cross-origin object
+
+    桥接 SDK 注入在**本窗口**，它自己用 window.parent.postMessage 往外发
+    （那是允许的跨域通信）。所以页面只需要看自己。
+
+    meme 那套页面从头到尾没碰过 parent，这也是它一直没出这个问题的原因。
+    """
+    source = APP_JS.read_text(encoding="utf-8")
+    # 去掉注释再查，注释里提到 window.parent 是允许的
+    code = "\n".join(
+        line for line in source.splitlines() if not line.strip().startswith(("*", "//", "/*"))
+    )
+    assert "window.parent" not in code, "不要读 window.parent（跨域对象，读属性会抛 SecurityError）"
+
+
+def test_does_not_wait_on_bridge_ready():
+    """不调 bridge.ready()。
+
+    它只在父页面发 `context` 时 resolve，等不到就永远悬着；发请求并不需要它。
+    """
+    source = APP_JS.read_text(encoding="utf-8")
+    code = "\n".join(
+        line for line in source.splitlines() if not line.strip().startswith(("*", "//", "/*"))
+    )
+    assert "bridge.ready" not in code, "不要 await bridge.ready()，它会无限悬着"
+
+
 def test_every_bridge_call_has_a_timeout():
     """桥接 SDK 的请求是「不 resolve 也不 reject」的 Promise。
 
@@ -106,9 +165,6 @@ def test_every_bridge_call_has_a_timeout():
     assert "withTimeout(" in source, "没有超时包装函数"
     assert "bridge.apiGet(" in source and "withTimeout(bridge.apiGet(" in source
     assert "bridge.apiPost(" in source and "withTimeout(bridge.apiPost(" in source
-    # ready() 同样没有超时，不能裸 await
-    assert "await bridge.ready()" not in source, "ready() 必须包超时"
-    assert "withTimeout(bridge.ready()" in source
 
 
 def test_page_does_not_cache_bridge_at_load_time():

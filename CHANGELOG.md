@@ -1,3 +1,33 @@
+# 2.2.3 · 2026-10-25
+
+## 修：`Permission denied to access property "AstrBotPluginPage" on cross-origin object`
+
+2.2.2 之后页面不卡了，但每个请求都报上面这句。**这是我自己引入的**：
+
+上一版为了「更稳」，我在找桥接层时顺手读了 `window.parent?.AstrBotPluginPage`。
+但面板给 iframe 的 sandbox 是 `allow-scripts allow-forms allow-downloads`，
+**没有 `allow-same-origin`** —— `window.parent` 是跨域对象，**读它的任何属性都会
+直接抛 SecurityError**，而不是返回 undefined，可选链 `?.` 也挡不住。
+
+桥接 SDK 是注入到**本窗口**的（它自己用 `window.parent.postMessage` 往外发，
+那是允许的跨域通信），页面根本不需要看父窗口。
+
+两处改动：
+
+1. `findBridge()` 只看 `window.AstrBotPluginPage` / `AstrBotPluginView`，
+   不再碰 `window.parent`；
+2. 顺手去掉 `bridge.ready()` —— 它只在父页面发 `context` 时 resolve，
+   等不到就永远悬着，而发请求并不需要它（meme 页面也是直接 `apiGet` 从不调它）。
+   少一个「可能永远不回来」的等待，就少一种安静卡死的死法。
+
+> 参考对象就是本仓库里已上线的 meme 页面：它从头到尾没碰过 `window.parent`，
+> 这也是它一直没出这个问题的原因。
+
+## 测试
+
+行为测试的 DOM 桩里把 `window.parent` 换成了**读属性就抛 SecurityError 的 Proxy**，
+原样复刻真实沙盒。写回 `window.parent?.AstrBotPluginPage` 会有 5 条测试变红。
+
 # 2.2.2 · 2026-10-25
 
 ## 修：页面永远停在「正在读取…」，一个红字都不给

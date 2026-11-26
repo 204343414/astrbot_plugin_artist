@@ -34,7 +34,6 @@ const BRIDGE_POLL_MS = 50;
  * 所以这里**每一处等待都必须自带超时**，宁可报错也不要悬着 —— 悬着的时候
  * 用户完全不知道发生了什么，报错至少能给下一步。
  */
-const READY_TIMEOUT_MS = 2500;
 const REQUEST_TIMEOUT_MS = 8000;
 
 function withTimeout(promise, ms, what) {
@@ -46,14 +45,20 @@ function withTimeout(promise, ms, what) {
   ]);
 }
 
+/* 只读**当前窗口**的全局对象，绝对不要碰 window.parent。
+ *
+ * 面板给 iframe 的 sandbox 是 `allow-scripts allow-forms allow-downloads`，
+ * **没有 allow-same-origin**，所以 `window.parent` 是个跨域对象：连「读一下属性」
+ * 都会直接抛 SecurityError，而不是返回 undefined。之前这里写了
+ * `window.parent?.AstrBotPluginPage`，可选链也挡不住它，于是整页报
+ *
+ *   Permission denied to access property "AstrBotPluginPage" on cross-origin object
+ *
+ * 桥接 SDK 是注入到**本窗口**的（它自己用 window.parent.postMessage 往外发，
+ * 那是允许的跨域通信），所以这里只需要看自己。
+ */
 function findBridge() {
-  return (
-    window.AstrBotPluginPage ||
-    window.AstrBotPluginView ||
-    window.parent?.AstrBotPluginPage ||
-    window.parent?.AstrBotPluginView ||
-    null
-  );
+  return window.AstrBotPluginPage || window.AstrBotPluginView || null;
 }
 
 /* 等到桥接层出现为止。超时就返回 null，交给调用方给一句能看懂的话。 */
@@ -376,16 +381,12 @@ on("testPrompt", "keydown", (event) => {
 async function boot() {
   // 给内联守卫打个标记：它据此判断「脚本到底跑起来了没有」。
   window.__artistPageBooted = true;
+  // 注意：**不调 bridge.ready()**。
+  //
+  // 它只等父页面那条 `context` 消息，来了才 resolve；等不到就永远悬着。
+  // 而发请求根本不需要它（meme 页面也是直接 apiGet，从来不调 ready）。
+  // 少一个“可能永远不回来”的等待，就少一种「页面安静卡住」的死法。
   const bridge = await waitForBridge();
-  if (bridge?.ready) {
-    try {
-      // 不能无限等：ready 只在父页面发 context 时 resolve，没有超时的。
-      await withTimeout(bridge.ready(), READY_TIMEOUT_MS, "等待面板就绪");
-    } catch (error) {
-      // 超时不算致命，接着往下走 —— 请求自己也有超时
-      console.warn("[artist page] 桥接层 ready 未就绪，继续尝试：", error.message);
-    }
-  }
   if (!bridge?.apiGet) {
     // 桥接层真的没有：把原因写在页面上，别让用户对着三个空盒子猜。
     banner(bridgeHint(), "error");
