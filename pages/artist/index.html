@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>画图参考图</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="titles">
+        <h1>画图参考图</h1>
+        <p id="subtitle">正在读取…</p>
+      </div>
+      <div class="topbar-actions">
+        <button id="refresh" class="ghost">刷新</button>
+      </div>
+    </header>
+
+    <p id="banner" class="banner hidden" role="status"></p>
+
+    <section id="slots" class="slots" aria-label="参考图"></section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>插件当前状态</h2>
+        <span id="infoMsg" class="msg">正在读取…</span>
+      </div>
+      <div id="infoGrid" class="info-grid"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>试画一张</h2>
+        <span class="msg">用当前配置直接调一次画图接口，和群里调用走的是同一条路。</span>
+      </div>
+      <div class="test-row">
+        <input id="testPrompt" type="text" placeholder="比如：一只戴着耳机的橘猫，赛博朋克霓虹风" />
+        <select id="testRatio" aria-label="宽高比">
+          <option value="auto">auto（交给接口）</option>
+          <option value="1:1">1:1 方图</option>
+          <option value="16:9">16:9 横屏</option>
+          <option value="9:16">9:16 竖屏</option>
+          <option value="4:3">4:3 横向</option>
+          <option value="3:4">3:4 竖向</option>
+        </select>
+        <button id="testRun" class="primary">试画</button>
+      </div>
+      <p id="testMsg" class="msg"></p>
+      <div id="testOut" class="test-out"></div>
+    </section>
+
+    <footer class="foot">
+      <p>
+        这两张图只是「参考」。想让 bot 在群里临时换画风，让它自己用
+        <code>set_drawing_reference</code> 工具记，那套是临时的、不写进配置。
+      </p>
+    </footer>
+  </main>
+  <script src="./app.js"></script>
+</body>
+</html>

@@ -35,6 +35,15 @@ def load_main():
         def event_message_type(*args, **kwargs):
             def deco(func): return func
             return deco
+        # 真实 AstrBot 的 filter 也有 llm_tool（`@filter.llm_tool(name=...)`）。
+        # 这个桩比那个功能老，原来缺它，导致 main.py 里按名字导入失败、
+        # 走进「没有 LLM 工具」的降级分支 —— 插件能加载，但测不到工具挂没挂上。
+        @staticmethod
+        def llm_tool(*args, **kwargs):
+            def deco(func):
+                func.__llm_tool_name__ = kwargs.get("name") or func.__name__
+                return func
+            return deco
     event_mod.AstrMessageEvent = AstrMessageEvent
     event_mod.MessageEventResult = MessageEventResult
     event_mod.filter = Filter

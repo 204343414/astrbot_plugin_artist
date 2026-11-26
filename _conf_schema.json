@@ -72,8 +72,22 @@
   "character_image_path": {
     "type": "string",
     "title": "角色人设参考图路径",
-    "description": "角色形象参考图的路径，用于生成角色反应图",
-    "hint": "例如: data/plugins/astrbot_plugin_gemini_artist/character/persona.png",
+    "description": "角色形象参考图的路径，画「你自己」时用",
+    "hint": "不用手填：打开插件后台页面「画图参考图」，直接上传一张即可，传完立刻生效。",
+    "default": ""
+  },
+  "enable_base_reference_image": {
+    "type": "bool",
+    "title": "启用默认参考图",
+    "description": "没有任何参考图时，用默认参考图兜底（保持画风一致）",
+    "hint": "说白了：群里发「画只猫」的时候，如果没有任何参考图，就用下面那张当风格底图。",
+    "default": false
+  },
+  "base_reference_image_path": {
+    "type": "string",
+    "title": "默认参考图路径",
+    "description": "兜底用的风格参考图路径；可以在插件后台页面直接上传，不必手填",
+    "hint": "手填的话例如 data/plugin_data/astrbot_plugin_artist/references/base.png；更省事的办法是打开插件后台页面「画图参考图」直接传。",
     "default": ""
   },
   "openai_image_quality": {

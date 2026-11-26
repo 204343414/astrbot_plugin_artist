@@ -29,8 +29,46 @@ class PromptSafetyBlockedError(Exception):
     """前置审核拒绝生图请求。"""
 
 
-@register("gemini_artist_plugin", "nichinichisou", "无会话 LLM 的一次性 OpenID 配额画图插件", "2.1.3")
-class GeminiArtist(Star):
+# 这两个模块是本插件自带的，不是第三方依赖 —— 用相对导入拿不到（AstrBot 把
+# 插件目录当顶层包挂），所以直接按模块名导入。导入失败时降级成「没有 LLM 工具
+# / 没有后台页面」，主功能（/draw）照样能用，不至于整插件起不来。
+try:
+    from .artist_tools import ArtistToolsMixin
+except ImportError:  # pragma: no cover - 被当顶层模块加载时
+    try:
+        from artist_tools import ArtistToolsMixin  # type: ignore
+    except Exception:  # noqa: BLE001
+        logger.warning("[Artist] artist_tools 导入失败，LLM 画图工具不可用", exc_info=True)
+
+        class ArtistToolsMixin:  # type: ignore[no-redef]
+            """占位基类。
+
+            这里**绝对不能**退化成 ``object``：``class GeminiArtist(object, Star)``
+            会直接抛 `Cannot create a consistent method resolution order`，
+            等于整个插件都加载不起来 —— 一个「画图工具坏了」不该升级成
+            「插件挂了」。退化成空类，最多是 LLM 没有画图工具。
+            """
+
+try:
+    from .reference_store import ReferenceStore
+except ImportError:  # pragma: no cover
+    try:
+        from reference_store import ReferenceStore  # type: ignore
+    except Exception:  # noqa: BLE001
+        ReferenceStore = None  # type: ignore[assignment,misc]
+        logger.warning("[Artist] reference_store 导入失败，参考图管理不可用", exc_info=True)
+
+try:
+    from .web_api import ArtistWebUI
+except ImportError:  # pragma: no cover
+    try:
+        from web_api import ArtistWebUI  # type: ignore
+    except Exception:  # noqa: BLE001
+        ArtistWebUI = None  # type: ignore[assignment,misc]
+
+
+@register("gemini_artist_plugin", "nichinichisou", "无会话 LLM 的一次性 OpenID 配额画图插件", "2.2.0")
+class GeminiArtist(ArtistToolsMixin, Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
 
@@ -66,6 +104,21 @@ class GeminiArtist(Star):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.usage_file = self.data_dir / "daily_usage.json"
         self.daily_usage = self._load_daily_usage()
+
+        # ===== 参考图管理（后台上传 / 预览 / 清除）=====
+        # 存到插件的 data_dir 下，而不是插件目录里：插件目录会在
+        # 「更新插件」时被整个覆盖掉，图丢在那里就白传了。
+        self.reference_store = (
+            ReferenceStore(self.data_dir) if ReferenceStore is not None else None
+        )
+        self.web_ui = None
+        if ArtistWebUI is not None:
+            try:
+                self.web_ui = ArtistWebUI(context, self)
+                self.web_ui.register()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[Artist] 后台页面接口注册失败（不影响画图）: {exc}", exc_info=True)
+                self.web_ui = None
 
         # 存储用户发送的图片URL缓存
         self.image_history_cache: Dict[Tuple[str, str], deque[Tuple[str, Optional[str]]]] = {}
@@ -1487,20 +1540,36 @@ class GeminiArtist(Star):
         except Exception as e:
             logger.error(f"HTTP 下载图片失败: {e}", exc_info=True)
             return None
-    def _load_base_reference_image(self) -> Optional[PILImage.Image]:
-        if not self.base_reference_image_path:
+    def _base_reference_image_or_none(self) -> Optional[PILImage.Image]:
+        """按「默认参考图」的开关取图，取不到就返回 None（调用方直接忽略）。"""
+        if not self.enable_base_reference_image:
             return None
+        return self._load_base_reference_image()
 
+    def _resolve_reference_path(self, slot: str, raw: str) -> Path:
+        """参考图路径解析：面板传的优先，其次才是配置里手填的。
+
+        为什么统一走这里：面板传的图存在 ``plugin_data/.../references/`` 下，
+        而配置项里填的可能是任意相对/绝对路径。两套解析逻辑各写一遍必然会
+        漂移，漂移的症状是「面板里能看到图、画图时却说找不到」。
+        """
+        if getattr(self, "reference_store", None) is not None:
+            resolved = self.reference_store.resolve(slot, raw)
+            if resolved is not None:
+                return resolved
+        image_path = Path(raw) if raw else Path("")
+        if image_path.is_absolute():
+            return image_path
         plugin_dir = Path(__file__).resolve().parent
-        image_path = Path(self.base_reference_image_path)
+        candidate = plugin_dir / image_path
+        if candidate.exists() and candidate.is_file():
+            return candidate
+        return plugin_dir.parent.parent.parent / image_path
 
-        if not image_path.is_absolute():
-            candidate = plugin_dir / image_path
-            if candidate.exists() and candidate.is_file():
-                image_path = candidate
-            else:
-                astrbot_root = plugin_dir.parent.parent.parent
-                image_path = astrbot_root / image_path
+    def _load_base_reference_image(self) -> Optional[PILImage.Image]:
+        if not self.base_reference_image_path and getattr(self, "reference_store", None) is None:
+            return None
+        image_path = self._resolve_reference_path("base", self.base_reference_image_path)
 
         if image_path.exists() and image_path.is_file():
             try:
@@ -1515,22 +1584,11 @@ class GeminiArtist(Star):
             logger.warning(f"配置的默认参考图路径不存在: {image_path}")
             return None
     def _load_character_reference_image(self) -> Optional[PILImage.Image]:
-        if not self.character_image_path:
+        if not self.character_image_path and getattr(self, "reference_store", None) is None:
             logger.warning("角色人设参考图路径未配置 (character_image_path)")
             return None
 
-        plugin_dir = Path(__file__).resolve().parent
-        image_path = Path(self.character_image_path)
-
-        if not image_path.is_absolute():
-            # 优先：相对于插件自身目录（Docker 里最稳）
-            candidate = plugin_dir / image_path
-            if candidate.exists() and candidate.is_file():
-                image_path = candidate
-            else:
-                # 兜底：相对于 AstrBot data 根目录（即 plugins 的上三级）
-                astrbot_root = plugin_dir.parent.parent.parent
-                image_path = astrbot_root / image_path
+        image_path = self._resolve_reference_path("character", self.character_image_path)
 
         if image_path.exists() and image_path.is_file():
             try:
@@ -1686,655 +1744,6 @@ class GeminiArtist(Star):
             if isinstance(msg_component, Image) and hasattr(msg_component, 'url') and msg_component.url:
                 self.store_user_image(user_id, group_id, msg_component.url, getattr(msg_component, 'file', None))
 
-    async def gemini_draw(
-        self,
-        event: AstrMessageEvent,
-        prompt: str,
-        image_index: int = 0,
-        reference_bot: bool = False,
-        aspect_ratio: str = "auto"
-    ) -> AsyncGenerator[Any, None]:
-        '''
-        AI图像生成与编辑工具。支持文生图、图生图、图像编辑等多种功能。
-        Args:
-            prompt (string): 图像生成或编辑的详细描述。
-            image_index (number, optional): 引用历史图片数量。0=不引用，1=引用最新1张，2=引用最新2张。默认0。
-            reference_bot (boolean, optional): 是否引用机器人之前生成的图片。默认False。
-            aspect_ratio (string, optional): 图片宽高比。可选: "auto"(由API决定), "1:1"(方形), "16:9"(横屏), "9:16"(竖屏), "4:3"(横向), "3:4"(竖向)。默认"auto"。
-        '''
-        if not self.api_keys:
-            yield event.plain_result("请联系管理员配置API密钥。")
-            return
-
-        if not hasattr(event, "message_obj") or not hasattr(event.message_obj, "type"):
-            logger.error("gemini_draw: 事件对象缺少 message_obj 或 type 属性。")
-            yield event.plain_result("处理消息时出错。")
-            return
-
-        command_sender_id = event.get_sender_id()
-        group_id = event.message_obj.group_id
-
-        # 白名单
-        if self.group_whitelist and str(event.message_obj.group_id or command_sender_id) not in map(str, self.group_whitelist):
-            return
-
-        # 忽略机器人自身
-        if self.robot_id_from_config and command_sender_id == self.robot_id_from_config:
-            return
-
-        # ===== 预算检查 =====
-        budget_group_id = str(group_id) if group_id else str(command_sender_id)
-        budget_allowed, budget_spent, budget_remaining = self._check_budget(budget_group_id)
-        if not budget_allowed:
-            budget_msg = f"今日该群画图额度已用完（已消耗 ¥{budget_spent:.2f}/¥{self.daily_group_budget:.2f}），明天零点重置哦~"
-            yield json.dumps({
-                "success": False,
-                "budget_exceeded": True,
-                "message": budget_msg,
-                "user_instruction_for_llm": f"绘图预算已耗尽，请你用自己的语气转告群友这个消息：{budget_msg}"
-            }, ensure_ascii=False)
-            return
-
-        all_text = (prompt or "").strip()
-        all_images_pil: List[PILImage.Image] = []
-        used_default_image = False
-        used_temp_reference = False
-
-        # ===== 优先处理回复消息里的图片 =====
-        replied_image_pil: Optional[PILImage.Image] = None
-        message_chain = event.get_messages()
-
-        for msg_component in message_chain:
-            if isinstance(msg_component, Reply):
-                logger.debug("检测到回复消息。尝试解析被引用的图片。")
-                source_chain: Optional[List[BaseMessageComponent]] = None
-
-                if hasattr(msg_component, "chain") and isinstance(msg_component.chain, list):
-                    source_chain = msg_component.chain
-                elif hasattr(msg_component, "message") and isinstance(msg_component.message, list):
-                    source_chain = msg_component.message
-                elif hasattr(msg_component, "source") and hasattr(msg_component.source, "message_chain") and isinstance(msg_component.source.message_chain, list):
-                    source_chain = msg_component.source.message_chain
-
-                if source_chain:
-                    for replied_part in source_chain:
-                        if isinstance(replied_part, Image) and getattr(replied_part, "url", None):
-                            replied_image_pil = await self.download_pil_image_from_url(replied_part.url, "直接引用的消息中的图片")
-                            if replied_image_pil:
-                                logger.info("成功从直接引用的消息中加载了图片作为参考。")
-                                all_images_pil.append(replied_image_pil)
-                            break
-
-                if replied_image_pil:
-                    # 有引用图就不要再走缓存索引
-                    image_index = 0
-                    reference_bot = False
-                break
-
-        # ===== 如果没有直接引用图，按 image_index 从缓存取 =====
-        if not all_images_pil and image_index > 0:
-            num_images_to_fetch = image_index
-            user_id_for_cache_lookup = str(self.robot_id_from_config) if reference_bot else str(command_sender_id)
-            group_id_for_cache_lookup = str(event.message_obj.group_id or command_sender_id)
-
-            key_for_cache = (user_id_for_cache_lookup, group_id_for_cache_lookup)
-            if key_for_cache in self.image_history_cache and self.image_history_cache[key_for_cache]:
-                cached_items_list = list(self.image_history_cache[key_for_cache])
-                actual_num_to_fetch = min(num_images_to_fetch, len(cached_items_list))
-                for i in range(1, actual_num_to_fetch + 1):
-                    pil_image_from_cache = await self.get_user_recent_image_pil_from_cache(
-                        user_id_for_cache_lookup,
-                        group_id_for_cache_lookup,
-                        i
-                    )
-                    if pil_image_from_cache:
-                        all_images_pil.append(pil_image_from_cache)
-
-        # ===== 临时参考图注入（style / identity） =====
-        session_key_for_temp = (command_sender_id, str(group_id) if group_id else str(command_sender_id))
-        temp_context = self.temp_reference_context.get(session_key_for_temp, {})
-
-        # 1) 风格参考插到最前
-        if "style" in temp_context:
-            all_images_pil.insert(0, temp_context["style"])
-            used_temp_reference = True
-            logger.info("gemini_draw: 注入了临时风格参考图")
-
-        # 2) 没有任何图时：identity 或默认立绘
-        if not all_images_pil:
-            if "identity" in temp_context:
-                all_images_pil.append(temp_context["identity"])
-                used_temp_reference = True
-                logger.info("gemini_draw: 使用了临时人设图")
-            elif self.enable_base_reference_image:
-                base_image = self._load_base_reference_image()
-                if base_image:
-                    all_images_pil.append(base_image)
-                    used_default_image = True
-
-        if not all_text and not all_images_pil:
-            yield event.plain_result("请提供文本描述或参考图片。")
-            event.stop_event()
-            return
-
-        # 提示词统一前缀 + 比例
-        if all_text:
-            all_text = f"Generate/modify images using the following prompt: {all_text}"
-        if aspect_ratio and aspect_ratio != "auto":
-            all_text = all_text + f" Image aspect ratio: {aspect_ratio}."
-
-        review_result = await self._review_prompt_before_generation(event, all_text, all_images_pil)
-        if not review_result.get("allowed", True):
-            blocked_reply = await self._handle_blocked_prompt(event, review_result)
-            yield event.plain_result(blocked_reply)
-            event.stop_event()
-            return
-
-        if self.enable_hinting:
-            await event.send(event.plain_result("🎨#(#!&...✍!"))
-
-        try:
-            logger.debug(f"gemini_draw: 调用 API 生成 (API类型: {self.api_type})")
-            result = await self._generate_by_api_type(all_text, all_images_pil, aspect_ratio)
-
-            if result is None or not isinstance(result, dict):
-                logger.error("gemini_draw: API 返回无效结果")
-                yield event.plain_result("处理图片时发生内部错误。")
-                event.stop_event()
-                return
-
-            text_response = (result.get("text", "") or "").strip()
-            image_paths = result.get("image_paths", []) or []
-
-            # ===== 缓存生成图片：归属给机器人（这样 reference_bot=True 才能取到）=====
-            if image_paths:
-                owner_id = str(self.robot_id_from_config) if self.robot_id_from_config else str(command_sender_id)
-                gid = str(group_id) if group_id else str(command_sender_id)
-                for i, img_path in enumerate(image_paths):
-                    if img_path and os.path.exists(img_path):
-                        self.store_user_image(
-                            owner_id,
-                            gid,
-                            img_path,
-                            f"generated_{i+1}_{os.path.basename(img_path)}"
-                        )
-
-            if not text_response and not image_paths:
-                yield event.plain_result("未能从API获取任何内容。")
-                event.stop_event()
-                return
-
-            # ===== 单图：直接发图 =====
-            if len(image_paths) < 2:
-                img_path = image_paths[0] if image_paths else None
-                if img_path and os.path.exists(img_path) and os.path.getsize(img_path) > 0:
-                    cost, spent_today, remaining, cost_info = self._record_spending_and_format(budget_group_id, len(image_paths))
-
-                    image_desc = text_response if text_response else "（API未返回文字描述，但图片已成功生成并发送）"
-                    llm_feedback = "你已亲自生成并发送图片。你是作者；不要问用户怎么P的；不要再次调用任何画图工具。"
-                    if used_temp_reference:
-                        llm_feedback += "（使用了临时参考图）"
-                    elif used_default_image:
-                        llm_feedback += "（使用了默认参考图）"
-
-                    tool_output_data = {
-                        "success": True,
-                        "image_already_sent": True,
-                        "image_description": image_desc,
-                        "number_of_images_generated": len(image_paths),
-                        "cost_this_time": cost,
-                        "budget_spent_today": spent_today,
-                        "budget_remaining": remaining,
-                        "user_instruction_for_llm": f"{llm_feedback} 图片内容：{image_desc}。{cost_info}"
-                    }
-                    # 先 yield 给 LLM（工具返回）
-                    yield json.dumps(tool_output_data, ensure_ascii=False)
-
-                    # 再发给用户（支持官方分片直传与通用消息链）
-                    await self._send_image_message(event, img_path)
-                    if cost_info:
-                        await event.send(event.plain_result(cost_info))
-
-                    # 最稳“防失忆”：再调用一次当前聊天 LLM 发表观后感
-                    await self._post_image_commentary_once(event, prompt, image_desc)
-                else:
-                    if text_response:
-                        yield event.plain_result(text_response)
-                    else:
-                        yield event.plain_result("抱歉，未能生成有效内容。")
-                return
-
-            # ===== 多图：QQ 官方平台逐张直传，其他平台 Nodes 合并转发 =====
-            if self._is_qq_official_event(event):
-                cost, spent_today, remaining, cost_info = self._record_spending_and_format(budget_group_id, len(image_paths))
-                image_desc = text_response if text_response else "（API未返回文字描述，但图片已成功生成并发送）"
-                tool_output_data = {
-                    "success": True,
-                    "image_already_sent": True,
-                    "image_description": image_desc,
-                    "number_of_images_generated": len(image_paths),
-                    "cost_this_time": cost,
-                    "budget_spent_today": spent_today,
-                    "budget_remaining": remaining,
-                    "user_instruction_for_llm": f"你已亲自生成并发送全部图片（你是作者）。禁止再次调用画图工具。图片内容：{image_desc}。{cost_info}"
-                }
-                yield json.dumps(tool_output_data, ensure_ascii=False)
-                if text_response:
-                    await event.send(event.plain_result(text_response))
-                for img_path in image_paths:
-                    if img_path and os.path.exists(img_path) and os.path.getsize(img_path) > 0:
-                        await self._send_image_message(event, img_path)
-                if cost_info:
-                    await event.send(event.plain_result(cost_info))
-                await self._post_image_commentary_once(event, prompt, image_desc)
-                return
-
-            bot_id_for_node_str = event.message_obj.self_id or self.robot_id_from_config or self.config.get("bot_id")
-            bot_id_for_node = int(str(bot_id_for_node_str).strip()) if bot_id_for_node_str and str(bot_id_for_node_str).strip().isdigit() else None
-
-            if bot_id_for_node is None:
-                chain = []
-                if text_response:
-                    chain.append(Plain(text_response))
-                for img_path in image_paths:
-                    if img_path and os.path.exists(img_path) and os.path.getsize(img_path) > 0:
-                        chain.append(Image.fromFileSystem(img_path))
-                if chain:
-                    yield event.chain_result(chain)
-                else:
-                    yield event.plain_result("抱歉，未能生成有效内容。")
-                return
-
-            bot_name_for_node = str(self.config.get("bot_name", "绘图助手")).strip() or "绘图助手"
-            ns = Nodes([])
-
-            if text_response:
-                ns.nodes.append(Node(user_id=bot_id_for_node, nickname=bot_name_for_node, content=[Plain(text_response)]))
-
-            for img_path in image_paths:
-                if img_path and os.path.exists(img_path) and os.path.getsize(img_path) > 0:
-                    ns.nodes.append(Node(user_id=bot_id_for_node, nickname=bot_name_for_node, content=[Image.fromFileSystem(img_path)]))
-
-            if ns.nodes:
-                cost, spent_today, remaining, cost_info = self._record_spending_and_format(budget_group_id, len(image_paths))
-
-                image_desc = text_response if text_response else "（API未返回文字描述，但图片已成功生成并发送）"
-                tool_output_data = {
-                    "success": True,
-                    "image_already_sent": True,
-                    "image_description": image_desc,
-                    "number_of_images_generated": len(image_paths),
-                    "cost_this_time": cost,
-                    "budget_spent_today": spent_today,
-                    "budget_remaining": remaining,
-                    "user_instruction_for_llm": f"你已亲自生成并发送全部图片（你是作者）。禁止再次调用画图工具。图片内容：{image_desc}。{cost_info}"
-                }
-                yield json.dumps(tool_output_data, ensure_ascii=False)
-
-                await event.send(event.chain_result([ns]))
-                if cost_info:
-                    await event.send(event.plain_result(cost_info))
-
-                await self._post_image_commentary_once(event, prompt, image_desc)
-            else:
-                yield event.plain_result("抱歉，未能生成有效内容。")
-
-        except PromptSafetyBlockedError as e:
-            logger.warning(f"gemini_draw: 模型侧安全拦截: {e}")
-            yield event.plain_result(self.prompt_review_block_message)
-        except Exception as e:
-            logger.error(f"gemini_draw 未知错误: {e}", exc_info=True)
-            yield event.plain_result(f"处理请求时发生意外错误: {str(e)}")
-    async def generate_self_reaction(self, event: AstrMessageEvent, scene_description: str) -> AsyncGenerator[Any, None]:
-        '''
-        对方希望画你自己时优先调用此画图工具。在明确了此要求的情况下绝对不要使用draw工具！用于魔改或表情包等。诸如与用户进行互动整活时使用。
-        该函数会自动使用你角色的参考图，比文字提示词精确。
-
-        Args:
-            scene_description (string): 画面描述。包括你的表情、情绪、动作、与对方当前的互动等。
-        '''
-        # 检查功能是否启用
-        if not self.enable_self_reaction:
-            yield json.dumps({"success": False, "message": "此功能未启用"}, ensure_ascii=False)
-            return
-
-        if not self.api_keys:
-            yield json.dumps({"success": False, "message": "API密钥未配置"}, ensure_ascii=False)
-            return
-
-        user_id = event.get_sender_id()
-        group_id = event.message_obj.group_id if hasattr(event.message_obj, 'group_id') and event.message_obj.group_id else user_id
-        session_key = (user_id, str(group_id))
-        # ===== 预算检查 =====
-        budget_group_id = str(group_id)
-        budget_allowed, budget_spent, budget_remaining = self._check_budget(budget_group_id)
-        if not budget_allowed:
-            budget_msg = f"今日该群画图额度已用完（已消耗 ¥{budget_spent:.2f}/¥{self.daily_group_budget:.2f}），明天零点重置~"
-            yield json.dumps({
-                "success": False,
-                "budget_exceeded": True,
-                "message": budget_msg,
-                "user_instruction_for_llm": f"绘图预算已耗尽，请你用自己的语气转告群友：{budget_msg}"
-            }, ensure_ascii=False)
-            return
-        # 冷却检查（软性提醒，不强制阻止）
-        current_time = time.time()
-        if session_key in self.reaction_cooldown:
-            elapsed = current_time - self.reaction_cooldown[session_key]
-            if elapsed < self.reaction_cooldown_seconds:
-                remaining = int(self.reaction_cooldown_seconds - elapsed)
-                logger.info(f"generate_self_reaction: 用户 {user_id} 冷却中，剩余 {remaining} 秒")
-                # 不强制阻止，只是记录日志，让LLM自己判断
-
-        
-        # 1. 确定角色人设图 (Identity)
-        character_img = None
-        used_temp_identity = False
-        
-        # 检查是否有临时人设 (通过 manage_drawing_reference 设置的)
-        if session_key in self.temp_reference_context and 'identity' in self.temp_reference_context[session_key]:
-            character_img = self.temp_reference_context[session_key]['identity']
-            used_temp_identity = True
-            logger.info("generate_self_reaction: 使用了临时设置的【人设】图")
-        
-        # 如果没有临时人设，使用配置文件里的默认立绘
-        if not character_img:
-            character_img = self._load_character_reference_image()
-
-        if not character_img:
-            yield json.dumps({"success": False, "message": "角色参考图未配置，无法生成反应图"}, ensure_ascii=False)
-            return
-
-        # 检查是否有用户回复的表情包（让角色模仿）
-        reference_meme_img: Optional[PILImage.Image] = None
-        message_chain = event.get_messages()
-        
-        for msg_component in message_chain:
-            if isinstance(msg_component, Reply):
-                source_chain = None
-                if hasattr(msg_component, 'chain') and isinstance(msg_component.chain, list):
-                    source_chain = msg_component.chain
-                elif hasattr(msg_component, 'message') and isinstance(msg_component.message, list):
-                    source_chain = msg_component.message
-                
-                if source_chain:
-                    for replied_part in source_chain:
-                        if isinstance(replied_part, Image) and hasattr(replied_part, 'url') and replied_part.url:
-                            reference_meme_img = await self.download_pil_image_from_url(
-                                replied_part.url, "用户回复的表情包"
-                            )
-                            if reference_meme_img:
-                                logger.info("成功获取用户回复的表情包作为模仿参考")
-                            break
-                break
-
-        # 构建图片列表和prompt
-        images_for_api: List[PILImage.Image] = [character_img]
-        has_reference_meme = False
-        
-        if reference_meme_img:
-            images_for_api.append(reference_meme_img)
-            has_reference_meme = True
-
-        final_prompt = self._build_reaction_prompt(scene_description, has_reference_meme)
-
-        review_result = await self._review_prompt_before_generation(event, final_prompt, images_for_api)
-        if not review_result.get("allowed", True):
-            blocked_reply = await self._handle_blocked_prompt(event, review_result)
-            yield json.dumps({"success": False, "message": blocked_reply}, ensure_ascii=False)
-            return
-
-        try:
-            logger.info(f"generate_self_reaction: 开始生成，场景: {scene_description[:50]}...")
-            
-            # 根据API类型调用生成
-            result = await self._generate_by_api_type(final_prompt, images_for_api, "3:4")
-
-            if not result or not isinstance(result, dict):
-                logger.error("generate_self_reaction: API返回无效")
-                yield json.dumps({"success": False, "message": "生成失败"}, ensure_ascii=False)
-                return
-
-            image_paths = result.get('image_paths', [])
-            
-            if not image_paths:
-                logger.warning("generate_self_reaction: 未生成图片")
-                yield json.dumps({"success": False, "message": "未能生成图片，请用文字回应"}, ensure_ascii=False)
-                return
-
-            # 审核图片
-            image_path = image_paths[0]  # 取第一张
-            review_passed = await self._review_generated_image(event, image_path, scene_description)
-            
-            if not review_passed:
-                logger.info("generate_self_reaction: 图片审核未通过，静默不发送")
-                yield json.dumps({"success": False, "message": "图片效果不佳，请用文字回应"}, ensure_ascii=False)
-                return
-
-            # 审核通过，更新冷却时间
-            self.reaction_cooldown[session_key] = current_time
-
-            # 缓存生成的图片
-            if self.robot_id_from_config:
-                self.store_user_image(
-                    str(self.robot_id_from_config),
-                    str(group_id),
-                    image_path,
-                    f"self_reaction_{os.path.basename(image_path)}"
-                )
-
-            # 记录花费
-            cost, spent_today, remaining, cost_info = self._record_spending_and_format(budget_group_id, 1)
-            
-            # 先告诉LLM结果（必须在发图之前）
-            yield json.dumps({
-                "success": True,
-                "image_already_sent": True,
-                "image_description": f"已按场景'{scene_description}'生成角色反应图并发送给用户",
-                "cost_this_time": cost,
-                "budget_spent_today": spent_today,
-                "budget_remaining": remaining,
-                "user_instruction_for_llm": f"角色反应图已成功生成并发送！不要再次调用任何画图工具！场景：{scene_description}。{cost_info}"
-            }, ensure_ascii=False)
-            # 然后发图片和预算提示给用户（自适应支持官方分片直传）
-            await self._send_image_message(event, image_path)
-            if cost_info:
-                await event.send(event.plain_result(cost_info))
-            await self._post_image_commentary_once(event, scene_description, f"角色反应图场景：{scene_description}")
-
-        except PromptSafetyBlockedError as e:
-            logger.warning(f"generate_self_reaction: 模型侧安全拦截: {e}")
-            yield json.dumps({"success": False, "message": self.prompt_review_block_message}, ensure_ascii=False)
-        except Exception as e:
-            logger.error(f"generate_self_reaction 错误: {e}", exc_info=True)
-            yield json.dumps({"success": False, "message": "生成过程出错，请用文字回应"}, ensure_ascii=False)    
-    
-
-    async def manage_drawing_reference(self, event: AstrMessageEvent, action: str, target: str = "style", image_index: int = 1) -> AsyncGenerator[Any, None]:
-        '''
-        管理绘图的参考图像/记忆。当用户想改变你的外貌设定，或者固定某种画风时使用。
-
-        Args:
-            action (string): 操作类型。可选: 
-                - "set": 设置参考图。
-                - "clear": 清除参考图。
-            target (string): 目标类型。
-                - "style": 风格/动作参考。用于"以后都用这种画风"、"记住这个构图"。不会改变你的角色长相。
-                - "identity": 身份/人设参考。用于"你变成猫娘"、"把你的立绘换成这张"。慎用！这会改变你的脸。
-                *注意：如果用户说"把这个表情包换成你自己"，请不要调用此工具！直接调用 generate_self_reaction 即可。*
-            image_index (number): 引用历史图片的索引（仅set时有效）。1=最新1张。默认1。
-        '''
-        user_id = event.get_sender_id()
-        group_id = event.message_obj.group_id if hasattr(event.message_obj, 'group_id') and event.message_obj.group_id else user_id
-        session_key = (user_id, str(group_id))
-
-        if action == "clear":
-            if session_key in self.temp_reference_context:
-                if target == "all":
-                    del self.temp_reference_context[session_key]
-                    msg = "已清除所有临时参考（人设和风格），恢复默认状态。"
-                elif target in self.temp_reference_context[session_key]:
-                    del self.temp_reference_context[session_key][target]
-                    msg = f"已清除临时{target}参考。"
-                else:
-                    msg = f"当前没有设置临时{target}参考。"
-            else:
-                msg = "当前没有设置任何临时参考图。"
-            
-            yield json.dumps({"success": True, "message": msg}, ensure_ascii=False)
-            return
-
-        elif action == "set":
-            # 获取图片逻辑
-            replied_image_pil = None
-            message_chain = event.get_messages()
-            for msg_component in message_chain:
-                if isinstance(msg_component, Reply):
-                    # ... (简化的回复解析逻辑，保持原有代码复用或如下) ...
-                    source_chain = getattr(msg_component, 'chain', []) or getattr(msg_component, 'message', [])
-                    if hasattr(msg_component, 'source') and hasattr(msg_component.source, 'message_chain'):
-                        source_chain = msg_component.source.message_chain
-                    if source_chain:
-                        for part in source_chain:
-                            if isinstance(part, Image) and hasattr(part, 'url') and part.url:
-                                replied_image_pil = await self.download_pil_image_from_url(part.url, "参考图")
-                                break
-                    break
-            
-            if not replied_image_pil:
-                replied_image_pil = await self.get_user_recent_image_pil_from_cache(user_id, str(group_id), image_index)
-
-            if not replied_image_pil:
-                yield json.dumps({"success": False, "message": "未找到图片，请确保回复了图片或最近发送过图片。"}, ensure_ascii=False)
-                return
-
-            if session_key not in self.temp_reference_context:
-                self.temp_reference_context[session_key] = {}
-            
-            self.temp_reference_context[session_key][target] = replied_image_pil
-            
-            # 区分反馈话术
-            if target == "identity":
-                feedback = "已更新临时【人设】。后续绘图我将长成这张图的样子（直到你清除它）。"
-            else:
-                feedback = "已记录【风格/动作】参考。后续绘图将参考这张图的构图或画风。"
-
-            yield json.dumps({"success": True, "message": feedback}, ensure_ascii=False)
-
-    async def combine_images_draw(self, event: AstrMessageEvent, prompt: str, image_indices: str = "1,2", use_character_ref: bool = True) -> AsyncGenerator[Any, None]:
-        '''
-        将多张图片合并/融合生成新图。当用户想把多张图结合在一起时使用。
-        例如："把这两张图合在一起"、"用第一张的风格画第二张的内容"、"融合这几张图"。
-
-        Args:
-            prompt (string): 描述如何合并这些图片。如"把图1的角色放到图2的场景中"。
-            image_indices (string): 要使用的图片索引，用逗号分隔。如"1,2"表示最新的两张，"1,2,3"表示最新的三张。默认"1,2"。
-            use_character_ref (boolean): 是否同时使用角色参考图来保持角色一致性。默认True。
-        '''
-        if not self.api_keys:
-            yield json.dumps({"success": False, "message": "API密钥未配置"}, ensure_ascii=False)
-            return
-
-        user_id = event.get_sender_id()
-        group_id = event.message_obj.group_id if hasattr(event.message_obj, 'group_id') and event.message_obj.group_id else user_id
-        # ===== 预算检查 =====
-        budget_group_id = str(group_id)
-        budget_allowed, budget_spent, budget_remaining = self._check_budget(budget_group_id)
-        if not budget_allowed:
-            budget_msg = f"今日该群画图额度已用完（已消耗 ¥{budget_spent:.2f}/¥{self.daily_group_budget:.2f}），明天零点重置~"
-            yield json.dumps({
-                "success": False,
-                "budget_exceeded": True,
-                "message": budget_msg,
-                "user_instruction_for_llm": f"绘图预算已耗尽，请你用自己的语气转告群友：{budget_msg}"
-            }, ensure_ascii=False)
-            return
-        # 解析图片索引
-        try:
-            indices = [int(x.strip()) for x in image_indices.split(',') if x.strip().isdigit()]
-        except:
-            indices = [1, 2]
-        
-        if not indices:
-            indices = [1, 2]
-
-        images_for_api: List[PILImage.Image] = []
-
-        # 如果需要角色参考图，先加载
-        if use_character_ref:
-            char_img = self._load_character_reference_image()
-            if char_img:
-                images_for_api.append(char_img)
-                logger.info("combine_images_draw: 添加了角色参考图")
-
-        # 按索引获取用户图片
-        for idx in indices:
-            pil_img = await self.get_user_recent_image_pil_from_cache(user_id, str(group_id), idx)
-            if pil_img:
-                images_for_api.append(pil_img)
-                logger.info(f"combine_images_draw: 添加了用户图片索引 {idx}")
-
-        if len(images_for_api) < 2:
-            yield json.dumps({
-                "success": False, 
-                "message": f"需要至少2张图片来合并，但只找到 {len(images_for_api)} 张。请确保用户最近发送过足够的图片。"
-            }, ensure_ascii=False)
-            return
-
-        # 构建提示词
-        final_prompt = f"合并/融合以下图片: {prompt}"
-        if use_character_ref:
-            final_prompt = f"参考图1是角色形象参考。" + final_prompt
-
-        review_result = await self._review_prompt_before_generation(event, final_prompt, images_for_api)
-        if not review_result.get("allowed", True):
-            blocked_reply = await self._handle_blocked_prompt(event, review_result)
-            yield json.dumps({"success": False, "message": blocked_reply}, ensure_ascii=False)
-            return
-
-        try:
-            result = await self._generate_by_api_type(final_prompt, images_for_api, "1:1")
-
-            if not result or not result.get('image_paths'):
-                yield json.dumps({"success": False, "message": "图片合并生成失败"}, ensure_ascii=False)
-                return
-
-            image_path = result['image_paths'][0]
-            
-            # 缓存生成的图片
-            if self.robot_id_from_config:
-                self.store_user_image(
-                    str(self.robot_id_from_config),
-                    str(group_id),
-                    image_path,
-                    f"combined_{os.path.basename(image_path)}"
-                )
-
-            chain = [Image.fromFileSystem(image_path)]
-             # 记录花费
-            cost, spent_today, remaining, cost_info = self._record_spending_and_format(budget_group_id, 1)
-            
-            # 先告诉LLM
-            yield json.dumps({
-                "success": True,
-                "image_already_sent": True,
-                "message": f"已合并 {len(images_for_api)} 张图片并发送。不要再次调用画图工具！",
-                "cost_this_time": cost,
-                "budget_spent_today": spent_today,
-                "budget_remaining": remaining,
-                "user_instruction_for_llm": f"图片合并完成并已发送给用户。{cost_info}。请勿重复调用。"
-            }, ensure_ascii=False)
-            # 然后发图片（自适应支持官方分片直传）
-            await self._send_image_message(event, image_path)
-            if cost_info:
-                await event.send(event.plain_result(cost_info))
-            await self._post_image_commentary_once(event, prompt, "多图合并结果已发送")
-        except PromptSafetyBlockedError as e:
-            logger.warning(f"combine_images_draw: 模型侧安全拦截: {e}")
-            yield json.dumps({"success": False, "message": self.prompt_review_block_message}, ensure_ascii=False)
-        except Exception as e:
-            logger.error(f"combine_images_draw 错误: {e}", exc_info=True)
-            yield json.dumps({"success": False, "message": "合并过程出错"}, ensure_ascii=False)    
     async def _draw_reference_images(self, event: AstrMessageEvent) -> List[PILImage.Image]:
         """Collect images from the /draw message and its quoted message."""
         components: List[Any] = list(event.get_messages() or [])
@@ -2390,6 +1799,12 @@ class GeminiArtist(Star):
 
         try:
             images = await self._draw_reference_images(event)
+            if not images:
+                # 兜底：启用「默认参考图」时给一个基础画风，命令和 LLM 工具走同一条规则。
+                # 以前这个开关只有那个从没被调用的 gemini_draw 里才认，等于摆设。
+                fallback = self._base_reference_image_or_none()
+                if fallback is not None:
+                    images = [fallback]
             reference_review = await self._review_reference_images_safety(images, event=event)
             if not reference_review.get("allowed", True):
                 yield event.plain_result(
@@ -2843,6 +2258,116 @@ class GeminiArtist(Star):
                 yield event.plain_result(f"未找到提供商: {image_provider_id}")
         except Exception as e:
             yield event.plain_result(f"获取提供商失败: {e}")    
+    # ===== 后台页面用的接口实现 =========================================
+    # web_api.py 只负责读请求和拼响应，真正干活的是下面这几个方法 ——
+    # 和群里的命令共用同一套配置、同一个参考图存储，不会出现
+    # 「面板传的图群里用不上」这种两边各说各话的情况。
+
+    def _reference_config_paths(self) -> Dict[str, str]:
+        """两个槽位当前配置项里填的路径（给面板判断「是不是面板管的」用）。"""
+        return {
+            "character": str(self.config.get("character_image_path", "") or ""),
+            "base": str(self.config.get("base_reference_image_path", "") or ""),
+        }
+
+    async def web_reference_state(self) -> Dict[str, Any]:
+        if self.reference_store is None:
+            return {"slots": [], "error": "参考图存储不可用"}
+        slots = await asyncio.to_thread(
+            self.reference_store.all_slots, self._reference_config_paths(), True
+        )
+        return {"slots": slots}
+
+    async def web_save_reference(self, slot: str, data: bytes, filename: str = "") -> Dict[str, Any]:
+        if self.reference_store is None:
+            raise ValueError("参考图存储不可用")
+        return await asyncio.to_thread(self.reference_store.save, slot, data, filename)
+
+    async def web_reference_path(self, slot: str):
+        if self.reference_store is None:
+            return None
+        path = self.reference_store.resolve(slot, self._reference_config_paths().get(slot, ""))
+        if path is None or not path.is_file():
+            return None
+        return path, self.reference_store.content_type(
+            slot, self._reference_config_paths().get(slot, "")
+        )
+
+    async def web_clear_reference(self, slot: str) -> bool:
+        if self.reference_store is None:
+            raise ValueError("参考图存储不可用")
+        if slot not in {"character", "base"}:
+            raise ValueError(f"不认识的槽位：{slot}")
+        return await asyncio.to_thread(self.reference_store.clear, slot)
+
+    async def web_plugin_info(self) -> Dict[str, Any]:
+        """面板上「插件当前状态」那一栏。都是只读信息，改不了任何东西。"""
+        return {
+            "apiType": str(self.api_type or ""),
+            "model": str(self.model_name_from_config or ""),
+            "apiKeys": len(self.api_keys),
+            "dailyLimit": int(self.daily_draw_limit),
+            "usedToday": 0,  # 日限额是按用户记的，面板这里不摊开，留给 /draw 回话
+            "groupBudget": float(self.daily_group_budget),
+            "costPerImage": float(self.cost_per_image),
+            "promptReview": bool(self.enable_prompt_review),
+            "characterPath": str(self.character_image_path or ""),
+            "basePath": str(self.base_reference_image_path or ""),
+            "enableBaseReference": bool(self.enable_base_reference_image),
+        }
+
+    async def web_test_draw(self, prompt: str) -> Dict[str, Any]:
+        """在面板里直接试画一张，验证配置是不是真的能用。
+
+        意义在于：群里画不出来时，用户分不清是「密钥坏了」「模型名写错了」
+        「参考图不存在」还是「被审核拦了」。这里没有消息事件、不占用户额度、
+        不发到任何群，报错会原样带回去。面板拿到的图和群里是同一条生成链路。
+        """
+        text = str(prompt or "").strip()
+        if not text:
+            return {"ok": False, "message": "提示词是空的"}
+        if not self.api_keys:
+            return {"ok": False, "message": "没有配置画图 API 密钥，先到「配置」里填 api_key"}
+        started = time.time()
+        try:
+            result = await self._generate_by_api_type(text, [], "auto")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Artist] 面板试画失败", exc_info=True)
+            return {
+                "ok": False,
+                "message": f"{type(exc).__name__}: {exc}",
+            }
+        image_path = ""
+        for path in (result.get("image_paths", []) if isinstance(result, dict) else []):
+            if path and os.path.exists(path) and os.path.getsize(path) > 0:
+                image_path = str(path)
+                break
+        if not image_path:
+            return {"ok": False, "message": "接口没有返回有效图片（路径为空或文件是 0 字节）"}
+        thumb = ""
+        try:
+            with PILImage.open(image_path) as image:
+                image.load()
+                copy = image.convert("RGB")
+                if max(copy.size) > 640:
+                    scale = 640 / float(max(copy.size))
+                    copy = copy.resize(
+                        (max(1, int(copy.size[0] * scale)), max(1, int(copy.size[1] * scale))),
+                        PILImage.LANCZOS,
+                    )
+                buffer = BytesIO()
+                copy.save(buffer, format="JPEG", quality=82, optimize=True)
+            thumb = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+        except Exception:  # noqa: BLE001
+            logger.warning("[Artist] 试画结果缩略图失败", exc_info=True)
+        return {
+            "ok": True,
+            "thumb": thumb,
+            "aspectRatio": "auto",
+            "elapsed": round(time.time() - started, 1),
+            "path": image_path,
+        }
+
     async def terminate(self):
         """
         插件终止时执行清理操作，包括清空图片缓存和取消后台清理任务。
