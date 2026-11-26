@@ -92,10 +92,17 @@
   </script>
 
   <!-- type="module" 不是风格问题，是必需的。
-       AstrBot 把桥接脚本注入在 `</body>` 之前，也就是这个标签之后；
+
+       AstrBot 会把桥接脚本插到「body 结束标签」之前，也就是这个 script 之后；
        普通脚本会立刻执行，于是 app.js 跑的时候 window.AstrBotPluginPage
-       还不存在（顶部取到的 bridge 永久是 undefined，所有按钮报「桥接层不可用」）。
-       模块脚本天生延迟到文档解析完才执行，正好落在桥接脚本之后。 -->
+       还不存在（所有按钮报「桥接层不可用」）。模块脚本天生延迟到文档解析完
+       才执行，正好落在桥接脚本之后。
+
+       ⚠️ 这里**绝对不能**写出 body 结束标签的字面量。
+       AstrBot 是用字符串替换的方式插入的，会命中**第一个**出现的那个，
+       写进注释里就等于把桥接脚本注释掉了 —— 页面照样能打开，但
+       window.AstrBotPluginPage 永远不存在，而且一个字都不报。
+       tests/test_page_markup.py 里有一条测试专门盯着这件事。 -->
   <script type="module" src="./app.js"></script>
 </body>
 </html>

@@ -1,3 +1,33 @@
+# 2.2.4 · 2026-10-25
+
+## 修：注释里写了 `</body>`，把桥接 SDK 一起注释掉了
+
+2.2.3 之后页面能开了，但每处都报「拿不到桥接层（SDK 未注入或被拦）」，
+硬刷新、重启都没用。**原因是我上一版写的注释本身。**
+
+AstrBot 注入桥接脚本用的是字符串替换：插到**第一个** `</body>` 之前。
+2.2.1 那版我在 `index.html` 里加了一大段注释解释这个机制，注释里**照抄了
+`</body>` 这个字面量**。于是插入点落进了注释内部，桥接脚本变成：
+
+```html
+<!-- …注入在 <script src="/api/plugin/page/bridge-sdk.js">…</script></body>` 之前… -->
+```
+
+脚本被注释掉了，`window.AstrBotPluginPage` 自然永远不存在。而且这个失败
+**极其安静**：页面能正常打开、样式正常、内联兜底脚本也在跑，控制台一个字都不报，
+跟「缓存没刷」「AstrBot 没重启」长得一模一样 —— 这也是我前几轮一直没找到的原因。
+
+修复：注释里不再出现这个字面量。**注入位置本身是对的，不需要改 AstrBot。**
+
+## 测试
+
+新增 `test_body_close_tag_appears_exactly_once`：入口 HTML 里 `</body>` 必须
+恰好出现一次。把字面量写回注释，这条立刻变红。
+
+另外这轮验证不再靠肉眼：直接用 JWT 请求面板自己的接口，取回**服务端真实拼接后
+的 HTML**，断言「桥接脚本没有落在任何注释内部」「app.js 在桥接脚本之前」
+「app.js 是 type=module」「`</body>` 只有 1 个」。
+
 # 2.2.3 · 2026-10-25
 
 ## 修：`Permission denied to access property "AstrBotPluginPage" on cross-origin object`

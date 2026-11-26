@@ -74,6 +74,22 @@ def test_every_element_id_used_by_js_exists():
     assert not missing, f"app.js 用到了 HTML 里不存在的元素 id：{missing}"
 
 
+def test_body_close_tag_appears_exactly_once():
+    """`</body>` 在入口 HTML 里必须**只出现一次**，而且必须在最外层。
+
+    AstrBot 注入桥接 SDK 的方式是字符串替换：插到**第一个** `</body>` 之前。
+    注释里只要出现这个字面量，桥接脚本就会落进注释里 —— 被注释掉、永不执行。
+    症状极难查：页面能正常打开、样式正常、内联兜底脚本也在跑，但
+    `window.AstrBotPluginPage` 永远不存在，而且控制台一个字都不报。
+    """
+    html = (PAGE_DIR / "index.html").read_text(encoding="utf-8")
+    occurrences = html.count("</body>")
+    assert occurrences == 1, (
+        f"`</body>` 出现了 {occurrences} 次；第一次出现的位置会被 AstrBot 用来插入"
+        "桥接脚本，注释里不能写这个字面量"
+    )
+
+
 def test_inline_guard_exists():
     """必须有一个**不依赖外部资源**的内联守卫。
 
