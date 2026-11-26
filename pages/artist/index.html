@@ -58,6 +58,11 @@
       </p>
     </footer>
   </main>
-  <script src="./app.js"></script>
+  <!-- type="module" 不是风格问题，是必需的。
+       AstrBot 把桥接脚本注入在 `</body>` 之前，也就是这个标签之后；
+       普通脚本会立刻执行，于是 app.js 跑的时候 window.AstrBotPluginPage
+       还不存在（顶部取到的 bridge 永久是 undefined，所有按钮报「桥接层不可用」）。
+       模块脚本天生延迟到文档解析完才执行，正好落在桥接脚本之后。 -->
+  <script type="module" src="./app.js"></script>
 </body>
 </html>

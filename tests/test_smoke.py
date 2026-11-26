@@ -45,11 +45,25 @@ def test_plugin_class_mro_is_sane(mod):
     assert names.index("ArtistToolsMixin") < names.index("Star")
 
 
-def test_version_bumped():
-    """版本号在 `@register(...)` 里，不是模块变量 —— 只能读源码。"""
-    source = (harness.Path(__file__).resolve().parents[1] / "main.py").read_text("utf-8")
-    assert '"2.2.0"' in source
-    assert '"2.1.3"' not in source.split("@register(")[1].split(")")[0]
+def test_version_matches_metadata():
+    """`@register(...)` 里的版本号必须和 metadata.yml 一致。
+
+    这两处对不上时没有任何报错，只是面板里显示旧版本号 —— 排查时会被误导成
+    「部署没生效」。所以直接读文件比对，不写死具体版本。
+    """
+    root = harness.Path(__file__).resolve().parents[1]
+    source = (root / "main.py").read_text("utf-8")
+    metadata = (root / "metadata.yml").read_text("utf-8")
+
+    register_line = source.split("@register(", 1)[1].split(")", 1)[0]
+    in_code = [part.strip().strip('"') for part in register_line.split(",")][-1]
+    in_meta = [
+        line.split(":", 1)[1].strip()
+        for line in metadata.splitlines()
+        if line.startswith("version:")
+    ][0]
+
+    assert in_code == in_meta, f"main.py 写的是 {in_code}，metadata.yml 写的是 {in_meta}"
 
 
 def test_conf_schema_has_base_reference_keys():

@@ -10,7 +10,41 @@
  * 2. 上传走 bridge.upload(endpoint, file)：原生 FormData + fetch 会被面板的
  *    作用域令牌挡住，桥接层才有权限。
  */
-const bridge = window.AstrBotPluginPage || window.AstrBotPluginView;
+/* 桥接层**不能**在加载时就取好。
+ *
+ * AstrBot 把桥接 SDK 注入在 `</body>` 之前，而本文件是页面自己的脚本。
+ * 如果这里写 `const bridge = window.AstrBotPluginPage`，取值那一刻 SDK 还没执行，
+ * bridge 就永久是 undefined —— 症状正是面板里看到的那一幕：页面能开、样式正常，
+ * 但每一处都报「桥接层不可用（AstrBotPluginPage.apiGet 缺失）」。
+ *
+ * index.html 那边已经改成 `type="module"`（模块脚本延迟执行，通常就没事了），
+ * 但**不能只靠这一点**：注入位置将来可能变、SDK 也可能异步补上。所以这里改成
+ * 每次用之前现取，并且会短暂等一等。
+ */
+const BRIDGE_WAIT_MS = 3000;
+const BRIDGE_POLL_MS = 50;
+
+function findBridge() {
+  return (
+    window.AstrBotPluginPage ||
+    window.AstrBotPluginView ||
+    window.parent?.AstrBotPluginPage ||
+    window.parent?.AstrBotPluginView ||
+    null
+  );
+}
+
+/* 等到桥接层出现为止。超时就返回 null，交给调用方给一句能看懂的话。 */
+async function waitForBridge() {
+  const deadline = Date.now() + BRIDGE_WAIT_MS;
+  for (;;) {
+    const found = findBridge();
+    if (found?.apiGet) return found;
+    if (Date.now() >= deadline) return found;
+    await new Promise((resolve) => setTimeout(resolve, BRIDGE_POLL_MS));
+  }
+}
+
 const el = (id) => document.getElementById(id);
 
 function on(id, type, handler) {
@@ -48,13 +82,26 @@ function unwrap(response) {
 }
 
 async function apiGet(name, params) {
-  if (!bridge?.apiGet) throw new Error("桥接层不可用（AstrBotPluginPage.apiGet 缺失）");
+  const bridge = await waitForBridge();
+  if (!bridge?.apiGet) throw new Error(bridgeHint());
   return unwrap(await bridge.apiGet(name, params || {}));
 }
 
 async function apiPost(name, body) {
-  if (!bridge?.apiPost) throw new Error("桥接层不可用（AstrBotPluginPage.apiPost 缺失）");
+  const bridge = await waitForBridge();
+  if (!bridge?.apiPost) throw new Error(bridgeHint());
   return unwrap(await bridge.apiPost(name, body || {}));
+}
+
+/* 一句话说清「为什么不能用」以及「怎么自救」，别只丢一个英文 API 名。 */
+function bridgeHint() {
+  const inIframe = window.self !== window.top;
+  return (
+    "拿不到 AstrBot 的页面桥接层（SDK 没注入或被拦）。\n" +
+    (inIframe
+      ? "建议：刷新整个面板页面（不是只刷新这一块）；还不行就硬刷新 Ctrl+F5。"
+      : "这个页面被单独打开了，它必须在 AstrBot 面板里打开才有权限。")
+  );
 }
 
 function fmtSize(bytes) {
@@ -215,7 +262,8 @@ async function uploadSlot(slot, input) {
   }
   banner(`正在上传 ${file.name}…`);
   try {
-    if (!bridge?.upload) throw new Error("桥接层不支持上传（AstrBotPluginPage.upload 缺失）");
+    const bridge = await waitForBridge();
+    if (!bridge?.upload) throw new Error(bridgeHint());
     /* endpoint 带查询串（?slot=xxx）：桥接层会把 query 原样拼到请求地址上，
      * 后端因此能从 query 里读到槽位。表单里再塞一份是为了兼容老版本。 */
     const endpoint = `ui/upload?slot=${encodeURIComponent(slot)}`;
@@ -300,10 +348,25 @@ on("testPrompt", "keydown", (event) => {
 });
 
 async function boot() {
-  try {
-    if (bridge?.ready) await bridge.ready();
-  } catch (error) {
-    console.warn("[artist page] 桥接层 ready 失败", error);
+  const bridge = await waitForBridge();
+  if (bridge?.ready) {
+    try {
+      await bridge.ready();
+    } catch (error) {
+      console.warn("[artist page] 桥接层 ready 失败", error);
+    }
+  }
+  if (!bridge?.apiGet) {
+    // 桥接层真的没有：把原因写在页面上，别让用户对着三个空盒子猜。
+    banner(bridgeHint(), "error");
+    const subtitle = el("subtitle");
+    if (subtitle) subtitle.textContent = "读不到数据";
+    const msg = el("infoMsg");
+    if (msg) {
+      msg.textContent = "桥接层未就绪，无法读取插件状态。";
+      msg.className = "msg error";
+    }
+    return;
   }
   await loadState();
   await loadInfo();

@@ -67,7 +67,7 @@ except ImportError:  # pragma: no cover
         ArtistWebUI = None  # type: ignore[assignment,misc]
 
 
-@register("gemini_artist_plugin", "nichinichisou", "无会话 LLM 的一次性 OpenID 配额画图插件", "2.2.0")
+@register("gemini_artist_plugin", "nichinichisou", "无会话 LLM 的一次性 OpenID 配额画图插件", "2.2.1")
 class GeminiArtist(ArtistToolsMixin, Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
