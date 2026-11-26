@@ -96,6 +96,21 @@ def test_page_recovers_when_bridge_arrives_late(delay):
     assert calls > 0, f"桥接层晚到 {delay}ms 时页面没恢复（apiGet 一次都没调）"
 
 
+def test_every_bridge_call_has_a_timeout():
+    """桥接 SDK 的请求是「不 resolve 也不 reject」的 Promise。
+
+    父页面不回消息时它就永远悬着 —— 真机症状是标题一直「正在读取…」、
+    一个红字都没有。所以 apiGet / apiPost / ready 都必须包超时。
+    """
+    source = APP_JS.read_text(encoding="utf-8")
+    assert "withTimeout(" in source, "没有超时包装函数"
+    assert "bridge.apiGet(" in source and "withTimeout(bridge.apiGet(" in source
+    assert "bridge.apiPost(" in source and "withTimeout(bridge.apiPost(" in source
+    # ready() 同样没有超时，不能裸 await
+    assert "await bridge.ready()" not in source, "ready() 必须包超时"
+    assert "withTimeout(bridge.ready()" in source
+
+
 def test_page_does_not_cache_bridge_at_load_time():
     """不能出现「加载时把桥接层存进常量」的写法 —— 那就是这个 bug 的根。
 

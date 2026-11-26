@@ -74,6 +74,21 @@ def test_every_element_id_used_by_js_exists():
     assert not missing, f"app.js 用到了 HTML 里不存在的元素 id：{missing}"
 
 
+def test_inline_guard_exists():
+    """必须有一个**不依赖外部资源**的内联守卫。
+
+    app.js 要是整个没跑起来（模块求值出错/资源被拦），页面会永远停在
+    「正在读取…」，用户看不出任何线索。内联脚本一定先执行，负责兜底报错。
+    """
+    html = (PAGE_DIR / "index.html").read_text(encoding="utf-8")
+    # 内联 script：有 <script> 但没 src
+    inline = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, re.S)
+    assert inline, "没有内联兜底脚本"
+    joined = "".join(inline)
+    assert "__artistPageBooted" in joined, "兜底脚本没有检查启动标记"
+    assert "脚本没能启动" in joined or "脚本报错" in joined
+
+
 def test_frontend_is_slot_agnostic():
     """前端按后端返回的 slot 泛型渲染，不硬编码槽位名。
 

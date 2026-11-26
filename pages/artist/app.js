@@ -24,6 +24,28 @@
 const BRIDGE_WAIT_MS = 3000;
 const BRIDGE_POLL_MS = 50;
 
+/* 面板回调的超时。
+ *
+ * 桥接 SDK 里的 `makeRequest` 是个**既不 resolve 也不 reject** 的 Promise ——
+ * 父页面要是不回 `response` 消息，它就永远悬着。实测症状就是标题一直
+ * 「正在读取…」、没有任何红字：看着像卡死，其实是在等一个永远不来的回复。
+ * `ready()` 更极端：它要等父页面发 `context`，同样没有超时。
+ *
+ * 所以这里**每一处等待都必须自带超时**，宁可报错也不要悬着 —— 悬着的时候
+ * 用户完全不知道发生了什么，报错至少能给下一步。
+ */
+const READY_TIMEOUT_MS = 2500;
+const REQUEST_TIMEOUT_MS = 8000;
+
+function withTimeout(promise, ms, what) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${what} 超时（${ms / 1000} 秒没有回应）`)), ms)
+    ),
+  ]);
+}
+
 function findBridge() {
   return (
     window.AstrBotPluginPage ||
@@ -84,13 +106,17 @@ function unwrap(response) {
 async function apiGet(name, params) {
   const bridge = await waitForBridge();
   if (!bridge?.apiGet) throw new Error(bridgeHint());
-  return unwrap(await bridge.apiGet(name, params || {}));
+  return unwrap(
+    await withTimeout(bridge.apiGet(name, params || {}), REQUEST_TIMEOUT_MS, `读取 ${name}`)
+  );
 }
 
 async function apiPost(name, body) {
   const bridge = await waitForBridge();
   if (!bridge?.apiPost) throw new Error(bridgeHint());
-  return unwrap(await bridge.apiPost(name, body || {}));
+  return unwrap(
+    await withTimeout(bridge.apiPost(name, body || {}), REQUEST_TIMEOUT_MS, `提交 ${name}`)
+  );
 }
 
 /* 一句话说清「为什么不能用」以及「怎么自救」，别只丢一个英文 API 名。 */
@@ -348,12 +374,16 @@ on("testPrompt", "keydown", (event) => {
 });
 
 async function boot() {
+  // 给内联守卫打个标记：它据此判断「脚本到底跑起来了没有」。
+  window.__artistPageBooted = true;
   const bridge = await waitForBridge();
   if (bridge?.ready) {
     try {
-      await bridge.ready();
+      // 不能无限等：ready 只在父页面发 context 时 resolve，没有超时的。
+      await withTimeout(bridge.ready(), READY_TIMEOUT_MS, "等待面板就绪");
     } catch (error) {
-      console.warn("[artist page] 桥接层 ready 失败", error);
+      // 超时不算致命，接着往下走 —— 请求自己也有超时
+      console.warn("[artist page] 桥接层 ready 未就绪，继续尝试：", error.message);
     }
   }
   if (!bridge?.apiGet) {

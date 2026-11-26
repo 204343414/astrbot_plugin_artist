@@ -58,6 +58,39 @@
       </p>
     </footer>
   </main>
+  <!-- 兜底守卫：普通内联脚本，一定比任何外部脚本先跑。
+       如果 app.js 因为任何原因整个没执行（模块求值出错、资源 404、被 CSP 拦），
+       页面上原本只会永远显示「正在读取…」，用户完全看不出发生了什么。
+       这段在 4 秒后把话说清楚。它不依赖任何外部资源，所以几乎不可能也挂掉。 -->
+  <script>
+    (function () {
+      var timer = setTimeout(function () {
+        if (window.__artistPageBooted) return;
+        var banner = document.getElementById("banner");
+        if (banner) {
+          banner.className = "banner error";
+          banner.textContent =
+            "页面脚本没能启动（app.js 未执行）。常见原因：浏览器缓存了旧版本，" +
+            "或者面板加载资源时被拦。请硬刷新（Ctrl+F5 / ⌘+Shift+R）后重试；" +
+            "仍然不行就看一下浏览器控制台里的红字。";
+        }
+        var subtitle = document.getElementById("subtitle");
+        if (subtitle) subtitle.textContent = "脚本未启动";
+      }, 4000);
+      window.addEventListener("error", function (event) {
+        if (window.__artistPageBooted) return;
+        clearTimeout(timer);
+        var banner = document.getElementById("banner");
+        if (banner) {
+          banner.className = "banner error";
+          banner.textContent =
+            "页面脚本报错：" + (event.message || "未知错误") +
+            "（" + (event.filename || "?") + ":" + (event.lineno || 0) + "）";
+        }
+      });
+    })();
+  </script>
+
   <!-- type="module" 不是风格问题，是必需的。
        AstrBot 把桥接脚本注入在 `</body>` 之前，也就是这个标签之后；
        普通脚本会立刻执行，于是 app.js 跑的时候 window.AstrBotPluginPage
