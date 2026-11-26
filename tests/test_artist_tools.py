@@ -377,3 +377,78 @@ def test_tool_context_shape():
     assert ctx.user_id == "u9"
     # 私聊时预算键回落到用户，不然「群里一份预算」在私聊里就没法算了
     assert ctx.scope == "u9"
+
+
+# --- 参考图审核不能拖死工具 -----------------------------------------------
+
+
+def test_reference_review_times_out_instead_of_hanging():
+    """审核 provider 挂掉时必须**快速失败**，不能让工具一直等。
+
+    线上真事（2026-11-26）：配置的视觉审核 provider 域名彻底不通
+    （api.futureppo.top，IPv4/IPv6 都拒绝连接）。`context.llm_generate` 内部
+    tenacity 重试 + provider 超时 120s，于是这个审核一路挂到 AstrBot 的
+    **工具执行上限**才被杀：
+
+        Exception: tool draw_image execution timeout after 120 seconds.
+
+    而 `/draw` 命令没有 120 秒上限，同一个坏 provider 在那边只是慢，
+    在工具路径上就是必死 —— 这就是「/draw 好的、工具超时」的真正原因。
+
+    现在审核自带 `asyncio.wait_for`，到点走 except，
+    按 `reference_safety_fail_closed=False` 放行。
+    """
+    import asyncio
+
+    class HangingContext:
+        async def llm_generate(self, **kwargs):
+            await asyncio.sleep(3600)
+
+    artist = FakeArtist(enable_reference_safety_review=True)
+    artist.context = HangingContext()
+    artist.reference_safety_provider_id = "dead-provider"
+    artist.reference_safety_review_timeout = 0.3
+    artist.reference_safety_fail_closed = False
+    # FakeArtist 里有个同名的假实现（供其它用例用），这里必须绑 main.py 的真身，
+    # 否则测的是桩、不是代码 —— 这种「测了个寂寞」最容易假过。
+    artist._review_reference_images_safety = (
+        LLMToolMethods._review_reference_images_safety.__get__(artist, FakeArtist)
+    )
+    artist._compose_reference_review_sheet = lambda images, max_images=9: images[0]
+    artist._pil_to_data_url = lambda img: "data:image/jpeg;base64,AAAA"
+
+    import time as _time
+
+    started = _time.monotonic()
+    result = asyncio.new_event_loop().run_until_complete(
+        artist._review_reference_images_safety([Image.new("RGB", (8, 8))])
+    )
+    elapsed = _time.monotonic() - started
+
+    assert result["allowed"] is True, "fail_closed=False 时超时应当放行"
+    assert elapsed < 5, f"没有超时保护，等了 {elapsed:.1f}s"
+
+
+def test_reference_review_fail_closed_blocks_on_timeout():
+    """`fail_closed=True` 时超时必须**拦住**，不能因为超时就悄悄放过去。"""
+    import asyncio
+
+    class HangingContext:
+        async def llm_generate(self, **kwargs):
+            await asyncio.sleep(3600)
+
+    artist = FakeArtist(enable_reference_safety_review=True)
+    artist.context = HangingContext()
+    artist.reference_safety_provider_id = "dead-provider"
+    artist.reference_safety_review_timeout = 0.3
+    artist.reference_safety_fail_closed = True
+    artist._review_reference_images_safety = (
+        LLMToolMethods._review_reference_images_safety.__get__(artist, FakeArtist)
+    )
+    artist._compose_reference_review_sheet = lambda images, max_images=9: images[0]
+    artist._pil_to_data_url = lambda img: "data:image/jpeg;base64,AAAA"
+
+    result = asyncio.new_event_loop().run_until_complete(
+        artist._review_reference_images_safety([Image.new("RGB", (8, 8))])
+    )
+    assert result["allowed"] is False

@@ -1,3 +1,51 @@
+# 2.2.6 · 2026-10-25
+
+## 修：工具超时 120 秒，而同一个 provider 下 `/draw` 没事
+
+2.2.5 修掉 `event` 之后，工具能跑了，但**超时**：
+
+```
+Exception: tool draw_image execution timeout after 120 seconds.
+```
+
+堆栈停在 `_review_reference_images_safety` → `context.llm_generate`。
+两个原因叠在一起：
+
+1. **配置的参考图审核 provider 已经死了**：`openai_1逆向/grok-4.7` 指向
+   `api.futureppo.top`，容器里 `curl` 无论 IPv4 还是 IPv6 都是
+   `Connection refused`，宿主直连也一样。模型本身没换、密钥也没错，就是域名不通。
+   同一个 provider 下 `omni-moderation-latest` 还在报 `503 model_not_found`。
+2. **这个审核调用没有超时**：`context.llm_generate` 内部有 tenacity 重试，
+   provider 超时配的是 120s，而 **AstrBot 给 LLM 工具的上限也正好是 120 秒**。
+   两个 120 撞在一起，工具必被砍。
+
+为什么 `/draw` 不超时：`/draw` 那条路径**没有参考图**（`images` 为空），
+`_review_reference_images_safety` 直接返回「不需要审核」，压根不碰那个坏 provider。
+工具路径带上了角色立绘 → 进入视觉审核 → 撞上死 provider。所以这不是
+「工具比命令差」，而是**只有工具这条路会走那个审核**。反过来说，只要给 `/draw`
+配上参考图，它同样会卡住 —— 这个 bug 一直都在，只是被路径差异藏住了。
+
+修法：审核调用包 `asyncio.wait_for`，新增配置
+`reference_safety_review_timeout`（默认 20 秒）。超时后按既有的
+`reference_safety_fail_closed` 决定：False（当前配置）→ 放行并记一条 warning；
+True → 拦截并说明原因。
+
+> 建议顺手做两件事：① 把 `reference_safety_provider_id` 换成一个能用的视觉模型，
+> 或者干脆留空（留空 + `fail_closed=False` 等于关掉这项审核）；
+> ② `prompt_review_model` 的 `omni-moderation-latest` 在现在这个中转上不存在，
+> 会一直 503 → 走兜底审核，能跑但多花一次请求。
+
+## 测试
+
+新增两条，**没有修复时会一直挂到测试框架超时**（实测跑了 600 秒被杀）：
+
+- `test_reference_review_times_out_instead_of_hanging`：provider 永远不返回时，
+  0.3 秒超时后必须放行（fail_closed=False）；
+- `test_reference_review_fail_closed_blocks_on_timeout`：fail_closed=True 时必须拦截。
+
+写这两条时踩到一个坑：`FakeArtist` 里原本就有同名的假 `_review_reference_images_safety`，
+直接调它测的是桩，不是代码。现在显式绑 `main.py` 的真身。
+
 # 2.2.5 · 2026-10-25
 
 ## 修：LLM 一调 `draw_image` 就报 missing 1 required positional argument: 'event'

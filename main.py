@@ -100,7 +100,7 @@ except ImportError:  # pragma: no cover
         ArtistWebUI = None  # type: ignore[assignment,misc]
 
 
-@register("gemini_artist_plugin", "nichinichisou", "无会话 LLM 的一次性 OpenID 配额画图插件", "2.2.5")
+@register("gemini_artist_plugin", "nichinichisou", "无会话 LLM 的一次性 OpenID 配额画图插件", "2.2.6")
 class GeminiArtist(ArtistToolsMixin, Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -233,6 +233,11 @@ class GeminiArtist(ArtistToolsMixin, Star):
         self.reference_safety_provider_id = str(
             config.get("reference_safety_provider_id", "") or ""
         ).strip()
+        # 单次参考图审核的等待上限（秒）。到点走 except 分支，
+        # 按 reference_safety_fail_closed 决定放行还是拦截。
+        self.reference_safety_review_timeout = max(
+            float(config.get("reference_safety_review_timeout", 20) or 20), 1.0
+        )
         self.reference_safety_fail_closed = bool(
             config.get("reference_safety_fail_closed", True)
         )
@@ -834,11 +839,21 @@ class GeminiArtist(ArtistToolsMixin, Star):
             '"suspicious_references":[],"confidence":0.0,"reason":""}'
         )
         try:
-            response = await self.context.llm_generate(
-                chat_provider_id=self.reference_safety_provider_id,
-                prompt=prompt,
-                image_urls=image_urls,
-                request_max_retries=1,
+            # 必须自带超时。这个审核走「核心 LLM provider」，而 provider 那边的
+            # 超时是 120s，AstrBot 给 LLM 工具的上限也是 120s —— 供应商一旦
+            # 连不上，这里必然撞上工具上限被杀：
+            #   Exception: tool draw_image execution timeout after 120 seconds.
+            # 而 /draw 命令没有这个上限，同一个坏 provider 在那边只是慢，
+            # 在工具路径上就是必死。这就是「/draw 正常、工具超时」的真因。
+            # 实测：2026-11-26 审核 provider 域名彻底不通，工具连续两次 120s 被杀。
+            response = await asyncio.wait_for(
+                self.context.llm_generate(
+                    chat_provider_id=self.reference_safety_provider_id,
+                    prompt=prompt,
+                    image_urls=image_urls,
+                    request_max_retries=1,
+                ),
+                timeout=self.reference_safety_review_timeout,
             )
             raw = str(getattr(response, "completion_text", "") or "").strip()
             match = re.search(r"\{.*\}", raw, flags=re.S)
