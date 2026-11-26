@@ -23,6 +23,35 @@ def test_llm_tools_reachable_from_plugin_class(mod):
         assert hasattr(mod.GeminiArtist, name), f"{name} 没被混进插件类"
 
 
+def test_llm_tools_are_defined_in_main_module(mod):
+    """三个 `@filter.llm_tool` 必须定义在**插件主模块**里。
+
+    这是线上翻车的那条：AstrBot 的 star_manager 只在
+        `handler.__module__ == 插件主模块路径`
+    时，才把插件实例 `functools.partial` 绑定到工具处理器上。
+    工具写在 `artist_tools.py` 里 → `__module__` 是 `…artist.artist_tools`，
+    而主模块是 `…artist.main`，两者永不相等 → 实例永远绑不上 →
+    模型调用时 `event` 被当成 `self` 吃掉，报：
+
+        TypeError: ArtistToolsMixin.draw_image() missing 1 required positional argument: 'event'
+
+    对照：同容器里 LLMTempBan 等插件的工具都直接写在 main.py，一切正常。
+
+    这里比的是函数的 `__module__`，而不是「类上有没有这个名字」—— 后者
+    在有 bug 的版本里也是 True（方法一直存在，只是没被绑定），拦不住。
+    """
+    # 桩里模块名是 artist_main_under_test，真实环境是 data.plugins.<插件>.main；
+    # 判据是「同一个模块」，不写死具体名字。
+    for name in ("draw_image", "set_drawing_reference", "list_drawing_references"):
+        fn = getattr(mod.GeminiArtist, name)
+        # 未绑定函数才有 __module__；取底层函数（可能被 partial 包过）
+        raw = getattr(fn, "__func__", fn)
+        assert raw.__module__ == mod.GeminiArtist.__module__, (
+            f"{name} 定义在 {raw.__module__}，但插件主模块是 "
+            f"{mod.GeminiArtist.__module__} —— 这样实例绑不上去，调用必崩"
+        )
+
+
 def test_old_yield_style_tools_are_gone(mod):
     """旧的三个 yield 版方法必须删掉。
 

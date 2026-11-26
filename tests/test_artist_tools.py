@@ -18,6 +18,15 @@ from PIL import Image
 import artist_tools
 from artist_tools import ASPECT_RATIOS, ArtistToolsMixin, ToolContext
 
+import test_admin_bypass as _harness
+
+# 三个 `@filter.llm_tool` 方法在 2.2.5 起挪进了 main.py（AstrBot 只给
+# 「定义在主模块里」的工具绑定插件实例，见 tests/test_smoke.py 里的说明）。
+# 所以要测到**真实实现**，必须把 main.py 里的方法混进来，而不是只继承
+# artist_tools 里的辅助函数。
+_main = _harness.load_main()
+LLMToolMethods = _main.GeminiArtist
+
 
 class FakeEvent:
     def __init__(self, sender="u1", group="g1", messages=None):
@@ -33,7 +42,18 @@ class FakeEvent:
 
 
 class FakeArtist(ArtistToolsMixin):
+    """测试用宿主。
+
+    继承关系要覆盖**真实的两半**：工具方法在 main.py，辅助函数在 artist_tools，
+    线上由 ``class GeminiArtist(ArtistToolsMixin, Star)`` 合在一起。只继承其一，
+    测到的就不是真实组合。
+    """
     """只实现工具真正用到的那几个宿主方法，其余全用假数据。"""
+
+    # 真实的工具方法（main.py 里的那份实现）
+    draw_image = LLMToolMethods.draw_image
+    set_drawing_reference = LLMToolMethods.set_drawing_reference
+    list_drawing_references = LLMToolMethods.list_drawing_references
 
     def __init__(self, **overrides):
         self.api_keys = ["k"]
@@ -137,7 +157,7 @@ def test_llm_tools_are_actually_registered():
     （`test_admin_bypass.py`）会用自己的桩把它替换掉，靠全局判断会假失败。
     """
     for name in ("draw_image", "set_drawing_reference", "list_drawing_references"):
-        func = getattr(ArtistToolsMixin, name)
+        func = getattr(LLMToolMethods, name)
         assert getattr(func, "__llm_tool_name__", "") == name, f"{name} 没挂 @filter.llm_tool"
 
 

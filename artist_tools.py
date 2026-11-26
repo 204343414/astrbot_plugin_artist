@@ -1,23 +1,18 @@
-"""LLM 工具：让模型自己决定画什么、拿哪张图当参考。
+"""LLM 工具用到的**辅助函数**（工具方法本身在 main.py 里）。
 
-为什么单独一个文件，而不是直接给 `main.py` 里那几个 `gemini_draw` 挂装饰器：
+为什么 `@filter.llm_tool` 的三个方法必须定义在 `main.py`，不能搬到这里：
 
-那三个方法（`gemini_draw` / `manage_drawing_reference` / `combine_images_draw`）
-的文档字符串写得像 LLM 工具，实现却是**命令式**的 —— 它们 `yield` 出一堆
-`event.plain_result`，而且离不开 `event`（要读引用消息、要取 group_id）。
-`@filter.llm_tool` 要的是「进去 → 返回一个字符串」，返回 `AsyncGenerator`
-会直接把调用链搞坏。这大概也正是它们一直没挂上装饰器的原因：
-`main.py` 里 `llm_tool` 一次都没出现过。
+    AstrBot 的 star_manager 绑定插件实例的条件是
+        `handler.__module__ == 插件主模块路径`
+    这里定义的话 `__module__` 是 `data.plugins.<插件>.artist_tools`，
+    而插件主模块是 `data.plugins.<插件>.main` —— 永远不相等，实例就永远绑不上去。
+    结果：模型调用工具时 `event` 被当成 `self` 吃掉，报
+        TypeError: ArtistToolsMixin.draw_image() missing 1 required positional argument: 'event'
+    实测对照：LLMTempBan 等能正常工作的插件，工具都直接写在 main.py 里。
 
-所以这里的做法是**另起一套真正独立于消息事件的实现**：
-
-* 所有上下文（用户、群、引用图、历史图缓存）在入口处一次性抓成纯数据；
-* 审核逻辑复用 `main.py` 里现成的 `_review_prompt_before_generation` 等；
-* 生成复用 `_generate_by_api_type`，发送复用 `_send_image_message`；
-* **对本函数外只暴露一个字符串**，里面是结构化 JSON，模型照着自己转述。
-
-关键约定：图片由工具自己发出去，返回给模型的话里明确写「已经发出去了，
-不要再调一次」。不然模型会以为工具只给了它一个路径，然后重复调用。
+所以本文件只放**不依赖 self / 不带装饰器**的东西：
+`ToolContext` 数据类、返回值拼装、参考图收集、发图记账等辅助逻辑，
+通过 `ArtistToolsMixin` 混进宿主类供 `main.py` 里的工具方法调用。
 """
 
 from __future__ import annotations
@@ -209,262 +204,10 @@ class ArtistToolsMixin:
 
     # --- 工具 1：画 ---------------------------------------------------------
 
-    @filter.llm_tool(name="draw_image")
-    async def draw_image(
-        self,
-        event: AstrMessageEvent,
-        prompt: str,
-        aspect_ratio: str = "auto",
-        use_character: bool = True,
-        use_base: bool = False,
-        image_index: int = 0,
-        reference_bot: bool = False,
-    ):
-        """画一张新图并直接发到当前会话。
-
-        什么时候用：对方要你画点什么、或者要你「画一下你自己」。
-
-        **画自己**：对方说「画你」「画一下你自己」「你长什么样」时，把
-        `use_character` 留在 True（默认），prompt 描述场景和动作即可 ——
-        你的长相会从立绘参考图里来，不需要你在提示词里描述外貌。
-        对方若刚从后台换了立绘，新图立刻生效，不用重启。
-
-        什么时候别用：对方只是想聊画图这件事、或者在问你上次那张图的细节。
-        也不要为了「显得积极」而在对方没要求时主动画。
-
-        Args:
-            prompt(string): 画面描述。写清楚**画什么、什么场景、什么动作、什么风格**。
-                别写「画一张好看的图」这种空话。
-            aspect_ratio(string): 宽高比，可选 "auto"(默认，交给接口决定)、
-                "1:1"(方图/头像)、"16:9"(横屏/风景/壁纸)、"9:16"(竖屏/手机)、
-                "4:3"(横向)、"3:4"(竖向)。
-            use_character(boolean): 是否带上你的角色立绘当参考，用来保持长相一致。
-                画自己、或画一个有固定形象的角色时保持 True。画纯风景/静物时可以关掉。
-            use_base(boolean): 什么都没参考时，是否用「默认参考图」兜底保持画风统一。
-                默认 False —— 只在对方说「还按之前那个画风」但手边又没有具体图时打开。
-            image_index(number): 额外引用缓存里的几张历史图当参考。0=不引用（默认），
-                1=引用最近 1 张，2=最近 2 张。对方说「照着刚才那张画」时用它。
-            reference_bot(boolean): image_index 引用的是不是你之前画过的图。
-                对方说「把刚才你画的那张改成…」时设 True。
-        """
-        ctx = self._tool_context(event)
-        if not self.api_keys:
-            return _result(
-                False,
-                "管理员还没配置画图 API 密钥。",
-                user_instruction_for_llm="告诉对方现在画不了（管理员没配密钥），不要再重试。",
-            )
-
-        text = str(prompt or "").strip()
-        if not text:
-            return _result(
-                False,
-                "提示词是空的。",
-                user_instruction_for_llm="问对方想画什么，具体一点。",
-            )
-
-        blocked = self._tool_quota_block(ctx)
-        if blocked:
-            return blocked
-
-        ratio = _clamp_ratio(aspect_ratio)
-        references, ref_counts = await self._tool_collect_references(
-            ctx,
-            image_index=max(0, int(image_index or 0)),
-            reference_bot=bool(reference_bot),
-            use_character=bool(use_character),
-            use_base=bool(use_base),
-        )
-
-        # 审核：和 /draw 走同一套。别为了"新入口"另写一份规则，
-        # 两份迟早不一致，而不一致的那一份会放过去不该放的东西。
-        if references:
-            reference_review = await self._review_reference_images_safety(
-                references, event=event
-            )
-            if not reference_review.get("allowed", True):
-                return _result(
-                    False,
-                    "参考图没通过安全识别："
-                    + str(reference_review.get("reason") or "包含高风险内容"),
-                    user_instruction_for_llm="如实告诉对方参考图不能用，换个图或换个描述。",
-                )
-
-        review = await self._review_prompt_before_generation(event, text, references)
-        if not review.get("allowed", True):
-            reason = str(review.get("reason") or "提示词没通过审核")
-            return _result(
-                False,
-                f"提示词被拦下了：{reason}",
-                blocked=True,
-                user_instruction_for_llm=(
-                    f"用你自己的语气拒绝这次画图要求（原因：{reason}），"
-                    "不要说教、不要重复对方的原话。"
-                ),
-            )
-
-        final_prompt = text
-        if ratio != "auto":
-            final_prompt = f"{text} Image aspect ratio: {ratio}."
-
-        try:
-            result = await self._generate_by_api_type(final_prompt, references, ratio)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("[Artist] 工具画图失败: %s", exc, exc_info=True)
-            return _result(
-                False,
-                f"画图接口报错：{type(exc).__name__}",
-                user_instruction_for_llm=(
-                    "接口这次没出图。用你的语气说一声没画成，不要编造图片内容。"
-                ),
-            )
-
-        image_path = self._tool_pick_image(result)
-        if not image_path:
-            return _result(
-                False,
-                "画图接口没有返回有效图片。",
-                user_instruction_for_llm="说一声这张没画出来，可以再试一次。",
-            )
-
-        sent = await self._tool_deliver(
-            ctx, event, image_path, prompt=text, references=references
-        )
-        if not sent:
-            # 生成成功但没发出去（QQ 官方分片失败、消息被拦…）。这时**不能**
-            # 说「已经发了」：模型会顺着这句话跟对方聊一张图，而对方什么都没看到。
-            return _result(
-                False,
-                "图画出来了，但没能发到会话里。",
-                image_sent=False,
-                aspect_ratio=ratio,
-                references=self._tool_describe_references(ref_counts),
-                user_instruction_for_llm=(
-                    "图没发出去。用你的语气说一声这次发送失败了，别描述图长什么样，"
-                    "也别假装发过了。"
-                ),
-            )
-        return _result(
-            True,
-            "图片已生成并**已经发到会话里了**。",
-            image_sent=True,          # ← 模型最容易忽略的一条，写在最显眼处
-            aspect_ratio=ratio,
-            references=self._tool_describe_references(ref_counts),
-            user_instruction_for_llm=(
-                "图已经发出去了，你**不要**再调用画图工具、也不要再描述这张图长什么样 "
-                "——对方已经看到了。用一两句自己的话说点什么就好。"
-            ),
-        )
 
     # --- 工具 2：参考图 -----------------------------------------------------
 
-    @filter.llm_tool(name="set_drawing_reference")
-    async def set_drawing_reference(
-        self,
-        event: AstrMessageEvent,
-        action: str = "set",
-        target: str = "style",
-        image_index: int = 1,
-    ):
-        """设置或清除**临时**参考图（只影响当前会话，不写进配置）。
 
-        什么时候用：对方说「以后都按这个画风画」「记住这个小动物」「你现在换成
-        这个样子」—— 他们想让接下来的几张图沿用某个参考。
-
-        「临时」是关键：这只活到本会话结束/被清除为止。要永久换掉人设立绘，
-        得去后台面板上传（那是管理员的事，不是你的）。
-
-        Args:
-            action(string): "set" 设置，"clear" 清除。默认 "set"。
-            target(string): "style" 画风/构图参考（推荐，安全）；
-                "identity" 身份参考（会改变"你长什么样"，只在对方明确要求
-                「你变成…」时用）；"all" 全部清除（仅 clear 时有效）。
-            image_index(number): 用缓存里第几张图，1=最新一张（默认）。
-        """
-        ctx = self._tool_context(event)
-        act = str(action or "set").strip().lower()
-        kind = str(target or "style").strip().lower()
-        if kind not in ("style", "identity", "all"):
-            return _result(False, f"不认识的 target：{kind}，只能是 style / identity / all。")
-
-        session_key = (ctx.user_id, ctx.session_id)
-        store = getattr(self, "temp_reference_context", None)
-        if store is None:
-            store = {}
-            self.temp_reference_context = store
-
-        if act == "clear":
-            if kind == "all":
-                store.pop(session_key, None)
-                return _result(True, "已清除全部临时参考图。")
-            if store.get(session_key, {}).pop(kind, None) is not None:
-                return _result(True, f"已清除临时{kind}参考。")
-            return _result(True, f"本来就没有设置{kind}参考。")
-
-        if act != "set":
-            return _result(False, f"不认识的 action：{act}，只能是 set / clear。")
-
-        image = None
-        for source in ctx.attached_images:
-            image = await self.download_pil_image_from_url(source, "临时参考图")
-            if image is not None:
-                break
-        if image is None:
-            image = await self.get_user_recent_image_pil_from_cache(
-                ctx.user_id, ctx.session_id, max(1, int(image_index or 1))
-            )
-        if image is None:
-            return _result(
-                False,
-                "没找到可用的图。",
-                user_instruction_for_llm=(
-                    "请对方发一张图或引用一张图，再说一次这个要求。"
-                ),
-            )
-
-        review = await self._review_reference_images_safety([image], event=event)
-        if not review.get("allowed", True):
-            return _result(
-                False,
-                "这张参考图没通过安全识别："
-                + str(review.get("reason") or "包含高风险内容"),
-            )
-
-        store.setdefault(session_key, {})[kind] = image
-        if kind == "identity":
-            return _result(
-                True,
-                "已记下临时人设参考，之后画你会是这个样子。",
-                user_instruction_for_llm="确认一下就好：之后画你会用这张图的样子，直到清除。",
-            )
-        return _result(
-            True,
-            "已记下临时画风参考。",
-            user_instruction_for_llm="确认一下就好：之后的图会参考这张的画风/构图。",
-        )
-
-    @filter.llm_tool(name="list_drawing_references")
-    async def list_drawing_references(self, event: AstrMessageEvent):
-        """查当前会话设置了哪些临时参考图、角色立绘有没有配好。
-
-        对方问「你现在用着什么参考」「画风记没记住」「你的立绘换了吗」时用它。
-        """
-        ctx = self._tool_context(event)
-        store = getattr(self, "temp_reference_context", {}) or {}
-        active = store.get((ctx.user_id, ctx.session_id), {}) or {}
-        character = ""
-        path = str(getattr(self, "character_image_path", "") or "")
-        if path and os.path.isfile(path):
-            character = os.path.basename(path)
-        return _result(
-            True,
-            "当前参考图状态。",
-            temporary=sorted(active),
-            character_portrait=character or "(未配置)",
-            # 立绘的修改时间是最有用的证据：对方说"我明明换了立绘没生效"，
-            # 看一眼时间就知道是不是没上传成功。
-            character_mtime=self._tool_mtime(path),
-        )
 
     # --- 内部 ---------------------------------------------------------------
 

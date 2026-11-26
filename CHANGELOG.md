@@ -1,3 +1,49 @@
+# 2.2.5 · 2026-10-25
+
+## 修：LLM 一调 `draw_image` 就报 missing 1 required positional argument: 'event'
+
+真机日志：
+
+```
+Agent 使用工具: ['draw_image']
+TypeError: ArtistToolsMixin.draw_image() missing 1 required positional argument: 'event'
+```
+
+**原因是三个工具方法写在了 `artist_tools.py` 这个子模块里。**
+
+AstrBot 的 `star_manager` 绑定插件实例的条件是：
+
+```python
+if ft.handler and getattr(ft.handler, "__module__", None) == metadata.module_path:
+    ft.handler = functools.partial(raw_handler, metadata.star_cls)   # 绑定实例
+```
+
+`metadata.module_path` 是插件主模块 `…artist.main`，而子模块里定义的函数
+`__module__` 是 `…artist.artist_tools` —— **永远不相等**，于是实例永远绑不上。
+没有绑定，`func_tool_manager.call()` 里的 `handler(event, **kwargs)` 就把
+`event` 当成了 `self`，真正的 `event` 自然「缺失」。
+
+实测对照（同一容器）：LLMTempBan、platformgate 等能正常工作的插件，工具都
+**直接写在 main.py 里**，`__module__` 与主模块相等，绑定成功。
+
+修法：把三个 `@filter.llm_tool` 方法（`draw_image` / `set_drawing_reference` /
+`list_drawing_references`）原样移动进 `main.py` 的 `GeminiArtist` 类。
+`artist_tools.py` 保留为纯辅助模块（数据类、参考图收集、发图记账），
+由 `ArtistToolsMixin` 混入。**代码逻辑零改动，只是换了定义位置。**
+
+顺带修掉一个迁移时引入的隐患：降级分支里曾伪造过一个永远返回 `"auto"` 的
+`_clamp_ratio`，会让「导入失败」表现成「所有图都变成方图」。现在降级分支
+直接抛错 —— 宁可工具不可用，也不要它悄悄地不对。
+
+## 测试
+
+- `test_llm_tools_are_defined_in_main_module`：断言三个工具函数的
+  `__module__` 与插件类所在模块相同。**这条能拦住本次线上事故** ——
+  原来的 `hasattr(GeminiArtist, name)` 在有 bug 的版本里也是 True（方法一直存在，
+  只是没被绑上），拦不住。
+- `test_artist_tools.py` 改为从 `main.py` 取真实实现来测，避免「测的是辅助模块、
+  跑的是 main.py」这种两张皮。
+
 # 2.2.4 · 2026-10-25
 
 ## 修：注释里写了 `</body>`，把桥接 SDK 一起注释掉了
